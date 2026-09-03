@@ -56,12 +56,6 @@ var (
 		true,
 		false,
 		true)
-	Auth = newFeature(
-		"auth",
-		"Enable authentication",
-		true,
-		false,
-		false)
 	ManagedSystemUpgradeController = newFeature(
 		"managed-system-upgrade-controller",
 		"Enable the installation of the system-upgrade-controller app as a managed system chart",
@@ -98,22 +92,16 @@ var (
 		true,
 		true,
 		true)
-	RKE1CustomNodeCleanup = newFeature(
-		"rke1-custom-node-cleanup",
-		"Enable cleanup RKE1 custom cluster nodes when they are deleted",
-		true,
-		true,
-		true)
 	HarvesterBaremetalContainerWorkload = newFeature(
 		"harvester-baremetal-container-workload",
-		"[Experimental]: Deploy container workloads to underlying harvester cluster",
+		"Deploy container workloads to underlying harvester cluster",
 		false,
 		true,
 		true)
 	ProvisioningV2FleetWorkspaceBackPopulation = newFeature(
 		"provisioningv2-fleet-workspace-back-population",
-		"[Experimental]: Allow Fleet workspace name to be changed on clusters administrated by provisioning v2",
-		false,
+		"Allow Fleet workspace name to be changed on clusters administrated by provisioning v2",
+		true,
 		false,
 		true)
 	UIExtension = newFeature(
@@ -121,18 +109,6 @@ var (
 		"Enable UI Extensions when starting Rancher",
 		true,
 		false,
-		true)
-	UISQLCache = newFeature(
-		"ui-sql-cache",
-		"Improve performance by enabling SQLite-backed caching. This also enables server-side pagination and other scaling based performance improvements.",
-		true,
-		false,
-		true)
-	RKE1UI = newFeature(
-		"rke1-ui",
-		"Enable RKE1 provisioning in the Rancher UI",
-		true,
-		true,
 		true)
 	ProvisioningPreBootstrap = newFeature(
 		"provisioningprebootstrap",
@@ -148,8 +124,8 @@ var (
 		true)
 	AggregatedRoleTemplates = newFeature(
 		"aggregated-roletemplates",
-		"[Experimental] Make RoleTemplates use aggregation for generated RBAC roles",
-		false,
+		"Make RoleTemplates use aggregation for generated RBAC roles",
+		true,
 		true,
 		true)
 	ClusterAgentSchedulingCustomization = newFeature(
@@ -210,6 +186,48 @@ var (
 		false,
 		true,
 	)
+	ImportedDay2Ops = newFeature(
+		"imported-day-2-ops",
+		"Enable day 2 ops for imported clusters",
+		true,
+		false,
+		true,
+	)
+	ClusterShell = newFeature(
+		"cluster-shell",
+		"Enable the Rancher cluster shell feature",
+		true,
+		false,
+		true,
+	)
+	NodeShell = newFeature(
+		"node-shell",
+		"Enable the Rancher node shell feature",
+		true,
+		false,
+		true,
+	)
+	PodShell = newFeature(
+		"pod-shell",
+		"Enable the Rancher pod shell feature",
+		true,
+		false,
+		true,
+	)
+	HideLocalAuthProvider = newFeature(
+		"hide-local-auth-provider",
+		"Hide the local auth provider when one or more external auth providers are active",
+		false,
+		true,
+		true,
+	)
+	CRTTokenTTLRotation = newFeature(
+		"crt-token-ttl-rotation",
+		"Enable TTL-based automatic rotation of ClusterRegistrationToken credentials",
+		true,
+		true,
+		true,
+	)
 )
 
 func ListEnabled() []string {
@@ -257,6 +275,20 @@ func InitializeFeatures(featuresClient managementv3.FeatureClient, featureArgs s
 	err := featuresClient.Delete("external-rules", &metav1.DeleteOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		logrus.Errorf("unable to delete external-rules feature: %v", err)
+	}
+
+	// ui-sql-cache feature flag was removed in 2.16, the SQLite-backed cache is
+	// always enabled. We need to delete it for users upgrading from 2.15.
+	err = featuresClient.Delete("ui-sql-cache", &metav1.DeleteOptions{})
+	if err != nil && !errors.IsNotFound(err) {
+		logrus.Errorf("unable to delete ui-sql-cache feature: %v", err)
+	}
+
+	// auth feature flag was removed in 2.16, authentication is always enabled.
+	// We need to delete it for users upgrading from 2.15.
+	err = featuresClient.Delete("auth", &metav1.DeleteOptions{})
+	if err != nil && !errors.IsNotFound(err) {
+		logrus.Errorf("unable to delete auth feature: %v", err)
 	}
 
 	// creates any features in map that do not exist, updates features with new default value

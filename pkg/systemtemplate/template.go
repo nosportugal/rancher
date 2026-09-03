@@ -89,15 +89,17 @@ data:
 
 ---
 
-{{- if .PrivateRegistryConfig}}
+{{- range .AllPullSecrets}}
 apiVersion: v1
 kind: Secret
 metadata:
-  name: cattle-private-registry
+  name: "{{.Name}}"
   namespace: cattle-system
+  labels:
+    management.cattle.io/cattle-cluster-agent-pull-secret: "true"
 type: kubernetes.io/dockerconfigjson
 data:
-  .dockerconfigjson: "{{.PrivateRegistryConfig}}"
+  .dockerconfigjson: "{{.DockerConfigJSON}}"
 
 ---
 {{- end }}
@@ -185,6 +187,13 @@ spec:
       {{- if .EnablePriorityClass }}
       priorityClassName: cattle-cluster-agent-priority-class
       {{- end }}
+      initContainers:
+      - name: rancher-charts-copy
+        image: {{.AssetsImage}}
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+        - name: rancher-charts
+          mountPath: /charts
       containers:
         - name: cluster-register
           imagePullPolicy: IfNotPresent
@@ -205,7 +214,7 @@ spec:
             value: "true"
           - name: CATTLE_K8S_MANAGED
             value: "true"
-          - name: CATTLE_CLUSTER_REGISTRY
+          - name: CATTLE_SYSTEM_DEFAULT_REGISTRY
             value: "{{.ClusterRegistry}}"
           - name: CATTLE_CREDENTIAL_NAME
             value: cattle-credentials-{{.TokenKey}}
@@ -218,23 +227,37 @@ spec:
           {{- if .IsPreBootstrap }}
           # since we're on the host network, talk to the apiserver over localhost
           {{- end }}
+          {{- if .SystemDefaultPullSecrets}}
+          - name: CATTLE_SYSTEM_DEFAULT_REGISTRY_PULL_SECRETS
+            value: "{{range $i, $s := .SystemDefaultPullSecrets}}{{if $i}},{{end}}{{$s.Name}}{{end}}"
+          {{- end }}
+          {{- if .AgentDeploymentPullSecrets }}
+          - name: CATTLE_AGENT_PULL_SECRETS
+            value: "{{range $i, $s := .AgentDeploymentPullSecrets}}{{if $i}},{{end}}{{$s.Name}}{{end}}"
+          {{- end }}
       {{- if .AgentEnvVars}}
 {{ .AgentEnvVars | indent 10 }}
       {{- end }}
-          image: {{.AgentImage}}
+          image: "{{.AgentImage}}"
           volumeMounts:
+          - name: rancher-charts
+            mountPath: /var/lib/rancher-data/local-catalogs/v2
           - name: cattle-credentials
             mountPath: /cattle-credentials
             readOnly: true
-      {{- if .PrivateRegistryConfig}}
+      {{- if .AgentDeploymentPullSecrets}}
       imagePullSecrets:
-      - name: cattle-private-registry
+      {{- range .AgentDeploymentPullSecrets}}
+      - name: "{{.Name}}"
+      {{- end }}
       {{- end }}
       {{- if .IsPreBootstrap }}
       # use hostNetwork since the CNI (and coreDNS) is not up yet
       hostNetwork: true
       {{- end }}
       volumes:
+      - name: rancher-charts
+        emptyDir: {}
       - name: cattle-credentials
         secret:
           secretName: cattle-credentials-{{.TokenKey}}
@@ -244,7 +267,6 @@ spec:
     rollingUpdate:
       maxUnavailable: 0
       maxSurge: 1
-      
 {{- if .AuthImage}}
 
 ---
@@ -291,15 +313,17 @@ spec:
       - operator: Exists
       containers:
       - name: kube-api-auth
-        image: {{.AuthImage}}
+        image: "{{.AuthImage}}"
         imagePullPolicy: IfNotPresent
         volumeMounts:
         - name: k8s-ssl
           mountPath: /etc/kubernetes
-      {{- if .PrivateRegistryConfig}}
+      {{- if .AgentDeploymentPullSecrets}}
       imagePullSecrets:
-      - name: cattle-private-registry
-      {{- end }}
+      {{- range .AgentDeploymentPullSecrets}}
+      - name: "{{.Name}}"
+      {{- end}}
+      {{- end}}
       volumes:
       - name: k8s-ssl
         hostPath:

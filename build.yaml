@@ -1,12 +1,15 @@
-webhookVersion: 109.0.0+up0.10.0-rc.11
-remoteDialerProxyVersion: 109.0.0+up0.7.0-rc.5
+# Container tags
+chartAuditLogImage: rancher/mirrored-bci-micro:16.0-15.11
+defaultShellVersion: rancher/shell:v0.8.1
+defaultSccOperatorImage: rancher/scc-operator:v0.5.2-rc.1
+# Notes: ClusterRepo asset and branch versions
+defaultAssetsImage: rancher/rancher-assets:v2.16-20260805T1815Z-dev
+chartDefaultBranch: dev-v2.16
+partnerChartDefaultBranch: main
+rke2ChartDefaultBranch: main
+# Charts Versions
+fleetVersion: 111.0.0+up0.17.0-alpha.2
+remoteDialerProxyVersion: 111.0.0+up0.9.0-rc.2
 # NOTE: CAPI controller version has to be updated in scripts/package-env
-turtlesVersion: 109.0.0+up0.26.0-rc.6
-cspAdapterMinVersion: 109.0.0+up9.0.0-rc.3
-defaultShellVersion: rancher/shell:v0.7.0-rc.6
-fleetVersion: 109.0.0+up0.15.0-rc.2
-defaultSccOperatorImage: rancher/scc-operator:v0.4.0-rc.1
-# NOTE: when updating this version, you will also need to update the hardcoded
-# k8s minor <-> image tag mapping in pkg/controllers/capr/autoscaler/fleet.go (imageTagVersions variable).
-# if adding support for a new k8s minor release (e.g. new rancher release)
-clusterAutoscalerChartVersion: 9.50.1
+turtlesVersion: 110.0.0+up0.27.0
+webhookVersion: 111.0.0+up0.12.1-rc.3

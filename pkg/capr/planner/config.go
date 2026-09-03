@@ -1,12 +1,17 @@
 package planner
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash"
+	"io"
 	"net"
 	"path"
 	"slices"
@@ -14,14 +19,18 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/pkg/errors"
+	planv1alpha1 "github.com/rancher/rancher/pkg/plan/api/plan.cattle.io/v1alpha1"
+	capi "sigs.k8s.io/cluster-api/api/core/v1beta2"
+
 	"github.com/rancher/norman/types/values"
 	rkev1 "github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1"
 	"github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1/plan"
 	"github.com/rancher/rancher/pkg/capr"
 	"github.com/rancher/rancher/pkg/controllers/management/secretmigrator"
 	"github.com/rancher/rancher/pkg/data/management"
-	"github.com/rancher/rancher/pkg/nodeconfig"
 	"github.com/rancher/rancher/pkg/provisioningv2/image"
+	"github.com/rancher/rancher/pkg/settings"
 	"github.com/rancher/wrangler/v3/pkg/data"
 	"github.com/rancher/wrangler/v3/pkg/data/convert"
 	corecontrollers "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
@@ -152,7 +161,7 @@ func addRoleConfig(config map[string]interface{}, controlPlane *rkev1.RKEControl
 		config["disable-etcd"] = true
 	}
 
-	if pr := image.GetPrivateRepoURLFromControlPlane(controlPlane); pr != "" && !isOnlyWorker(entry) {
+	if pr, _ := image.GetPrivateRepoURLFromControlPlane(controlPlane); pr != "" && !isOnlyWorker(entry) {
 		config["system-default-registry"] = pr
 	}
 
@@ -178,6 +187,50 @@ func addRoleConfig(config map[string]interface{}, controlPlane *rkev1.RKEControl
 		config["node-name"] = nodeName
 	}
 	return joinServer
+}
+
+// addRKE2Prime adds the "prime" server argument to the config map if the following conditions are met:
+// 1. The cluster is RKE2 (not K3S)
+// 2. The node is a server node (not worker-only)
+// 3. The user has not already explicitly set "prime" in config
+// 4. The KDM release data includes "prime" as a valid server arg for this version
+// 5. The per-cluster annotation or global setting enables prime
+func addRKE2Prime(config map[string]interface{}, controlPlane *rkev1.RKEControlPlane, entry *planEntry) {
+	// Only applies to RKE2 server nodes
+	runtime := capr.GetRuntime(controlPlane.Spec.KubernetesVersion)
+	if runtime != capr.RuntimeRKE2 || isOnlyWorker(entry) {
+		return
+	}
+
+	// If user has already explicitly set "prime", respect their choice
+	if _, exists := config["prime"]; exists {
+		return
+	}
+
+	// Determine if prime should be enabled: annotation takes precedence over global setting.
+	// An empty annotation value is treated the same as absent (fall through to global setting).
+	primeEnabled := false
+	if ann, ok := controlPlane.Annotations[capr.RKE2PrimeEnabledAnnotation]; ok && ann != "" {
+		primeEnabled = strings.EqualFold(ann, "true")
+	} else {
+		primeEnabled = strings.EqualFold(settings.Rke2ProvisioningPrimeDefault.Get(), "true")
+	}
+
+	if !primeEnabled {
+		return
+	}
+
+	// Verify this RKE2 version supports the prime arg via KDM release data
+	release := capr.GetKDMReleaseData(context.TODO(), controlPlane)
+	if release == nil {
+		return
+	}
+	if _, supported := release.ServerArgs["prime"]; !supported {
+		logrus.Debugf("RKE2 version %s does not support the prime server arg, skipping", controlPlane.Spec.KubernetesVersion)
+		return
+	}
+
+	config["prime"] = true
 }
 
 func addLocalClusterAuthenticationEndpointConfig(config map[string]interface{}, controlPlane *rkev1.RKEControlPlane, entry *planEntry) {
@@ -394,15 +447,15 @@ func getMachineNetworkInfo(secrets corecontrollers.SecretCache, entry *planEntry
 	info.Entry = entry
 	if ips := entry.Metadata.Annotations[capr.InternalAddressAnnotation]; ips != "" {
 		for _, ip := range strings.Split(ips, ",") {
-			if ip != "" {
-				info.InternalAddresses = append(info.InternalAddresses, strings.TrimSpace(ip))
+			if ip = strings.TrimSpace(ip); ip != "" {
+				info.InternalAddresses = append(info.InternalAddresses, ip)
 			}
 		}
 	}
 	if ips := entry.Metadata.Annotations[capr.AddressAnnotation]; ips != "" {
 		for _, ip := range strings.Split(ips, ",") {
-			if ip != "" {
-				info.ExternalAddresses = append(info.ExternalAddresses, strings.TrimSpace(ip))
+			if ip = strings.TrimSpace(ip); ip != "" {
+				info.ExternalAddresses = append(info.ExternalAddresses, ip)
 			}
 		}
 	}
@@ -426,7 +479,7 @@ func getMachineNetworkInfo(secrets corecontrollers.SecretCache, entry *planEntry
 		return nil, fmt.Errorf("machine state secret for machine %s/%s not found", entry.Machine.Namespace, entry.Machine.Name)
 	}
 
-	driverConfig, err := nodeconfig.ExtractConfigJSON(base64.StdEncoding.EncodeToString(secret.Data["extractedConfig"]))
+	driverConfig, err := extractConfigJSON(base64.StdEncoding.EncodeToString(secret.Data["extractedConfig"]))
 	if err != nil {
 		return nil, fmt.Errorf("error getting machine state JSON for machine %s/%s: %w", entry.Machine.Namespace, entry.Machine.Name, err)
 	}
@@ -454,6 +507,7 @@ func getMachineNetworkInfo(secrets corecontrollers.SecretCache, entry *planEntry
 func updateConfigWithAddresses(config map[string]interface{}, info *machineNetworkInfo) {
 	nodeIPs := convert.ToStringSlice(config["node-ip"])
 	var toAdd []string
+	primaryNodeIPFamily := primaryAddressFamily(config)
 
 	switch info.DriverName {
 	case management.PodDriver:
@@ -487,15 +541,15 @@ func updateConfigWithAddresses(config map[string]interface{}, info *machineNetwo
 	if info.IPv6Address != "" && !slices.Contains(nodeIPs, info.IPv6Address) {
 		nodeIPs = append(nodeIPs, info.IPv6Address)
 	}
-
+	nodeIPs = reorderAddressesByFamily(nodeIPs, primaryNodeIPFamily)
 	config["node-ip"] = nodeIPs
 
 	// If a cloud provider is configured, it will manage the external IP.
-	// If no cloud provider is set, assign node-external-ip if public IPs are available,
-	// and have not already been assigned to node-ip.
-	if convert.ToString(config["cloud-provider-name"]) == "" {
+	// If node-ip is not set, then do not set node-external-ip.
+	if convert.ToString(config["cloud-provider-name"]) == "" && len(nodeIPs) > 0 {
 		nodeExternalIPs := convert.ToStringSlice(config["node-external-ip"])
 		for _, ip := range info.ExternalAddresses {
+			// Assign node public IPs to node-external-ip if it has not already been assigned to node-ip.
 			if ip == "" || slices.Contains(nodeExternalIPs, ip) || slices.Contains(nodeIPs, ip) {
 				continue
 			}
@@ -508,25 +562,89 @@ func updateConfigWithAddresses(config map[string]interface{}, info *machineNetwo
 
 			nodeExternalIPs = append(nodeExternalIPs, ip)
 		}
+		nodeExternalIPs = reorderAddressesByFamily(nodeExternalIPs, primaryNodeIPFamily)
 		config["node-external-ip"] = nodeExternalIPs
 	}
 }
 
-// updateConfigWithAdvertiseAddresses sets the advertise-address and tls-san in the config
-// if the non-worker node has different internal and external IPs.
+// primaryAddressFamily inspects the "service-cidr" key in the provided config map and returns the IP address
+// family (4 or 6) of the first non-empty CIDR found;
+// returns 0 if "service-cidr" is absent, empty, or if the first non-empty CIDR is not a valid network address.
+// The service-cidr value should be a comma-separated string.
+func primaryAddressFamily(config map[string]interface{}) int {
+	for _, serviceCIDRValue := range convert.ToStringSlice(config["service-cidr"]) {
+		for _, serviceCIDR := range strings.Split(serviceCIDRValue, ",") {
+			serviceCIDR = strings.TrimSpace(serviceCIDR)
+			if serviceCIDR == "" {
+				continue
+			}
+			_, parsedCIDR, err := net.ParseCIDR(serviceCIDR)
+			if err != nil {
+				return 0
+			}
+			if parsedCIDR.IP.To4() != nil {
+				return 4
+			}
+			return 6
+		}
+	}
+	return 0
+}
+
+// reorderAddressesByFamily reorders the provided address slice so that addresses belonging to the primary IP family
+// (4 for IPv4, 6 for IPv6) are placed first, followed by addresses of the other IP family, and finally any values
+// that cannot be parsed as IP addresses (e.g. interface names). The relative order within each group is preserved.
+// The slice is returned unchanged when it contains fewer than two elements or when primaryFamily is 0.
+func reorderAddressesByFamily(addresses []string, primaryFamily int) []string {
+	if len(addresses) < 2 || primaryFamily == 0 {
+		return addresses
+	}
+
+	primary := make([]string, 0, len(addresses))
+	other := make([]string, 0, len(addresses))
+	nonIP := make([]string, 0, len(addresses))
+
+	for _, address := range addresses {
+		parsedIP := net.ParseIP(address)
+		if parsedIP == nil {
+			nonIP = append(nonIP, address)
+			continue
+		}
+
+		if primaryFamily == 4 && parsedIP.To4() != nil {
+			primary = append(primary, address)
+			continue
+		}
+		if primaryFamily == 6 && parsedIP.To4() == nil {
+			primary = append(primary, address)
+			continue
+		}
+
+		other = append(other, address)
+	}
+
+	return append(append(primary, other...), nonIP...)
+}
+
+// updateConfigWithAdvertiseAddresses sets advertise-address and tls-san in the config
+// for non-worker nodes when the configured node-ip and node-external-ip values differ.
+// It reads node-ip and node-external-ip from the config (already ordered by preferred IP family)
+// and uses the first node-ip value as the advertise-address.
 func updateConfigWithAdvertiseAddresses(config map[string]interface{}, info *machineNetworkInfo) {
-	if isOnlyWorker(info.Entry) || len(info.InternalAddresses) == 0 || len(info.ExternalAddresses) == 0 {
+	nodeIPs := convert.ToStringSlice(config["node-ip"])
+	nodeExternalIPs := convert.ToStringSlice(config["node-external-ip"])
+	if isOnlyWorker(info.Entry) || len(nodeIPs) == 0 || len(nodeExternalIPs) == 0 {
 		return
 	}
-	internalAddresses := slices.Clone(info.InternalAddresses)
-	externalAddresses := slices.Clone(info.ExternalAddresses)
+	internalAddresses := slices.Clone(nodeIPs)
+	externalAddresses := slices.Clone(nodeExternalIPs)
 	slices.Sort(internalAddresses)
 	slices.Sort(externalAddresses)
 	if !slices.Equal(internalAddresses, externalAddresses) {
-		config["advertise-address"] = info.InternalAddresses[0]
+		config["advertise-address"] = nodeIPs[0]
 
 		tlsSan := convert.ToStringSlice(config["tls-san"])
-		for _, ip := range info.ExternalAddresses {
+		for _, ip := range nodeExternalIPs {
 			if !slices.Contains(tlsSan, ip) {
 				tlsSan = append(tlsSan, ip)
 			}
@@ -535,7 +653,7 @@ func updateConfigWithAdvertiseAddresses(config map[string]interface{}, info *mac
 	}
 }
 
-func addLabels(config map[string]interface{}, entry *planEntry) error {
+func addLabels(config map[string]interface{}, cluster *capi.Cluster, entry *planEntry) error {
 	var labels []string
 	if data := entry.Metadata.Annotations[capr.LabelsAnnotation]; data != "" {
 		labelMap := map[string]string{}
@@ -548,6 +666,23 @@ func addLabels(config map[string]interface{}, entry *planEntry) error {
 	}
 
 	labels = append(labels, capr.MachineUIDLabel+"="+string(entry.Machine.UID))
+
+	lifecycleLabels, err := planv1alpha1.ObjToClusterLifecycleLabels(cluster)
+	if err != nil {
+		return err
+	}
+	for k, v := range lifecycleLabels {
+		labels = append(labels, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	lifecycleLabels, err = planv1alpha1.ObjToMachineLifecycleLabels(entry.Machine)
+	if err != nil {
+		return err
+	}
+	for k, v := range lifecycleLabels {
+		labels = append(labels, fmt.Sprintf("%s=%s", k, v))
+	}
+
 	sort.Strings(labels)
 	if len(labels) > 0 {
 		config["node-label"] = labels
@@ -722,7 +857,7 @@ func (p *Planner) renderFiles(controlPlane *rkev1.RKEControlPlane, entry *planEn
 // are referenced in the distribution configuration file (for example, ACE and the cloud-provider). It returns the updated
 // NodePlan, the config that was rendered in a map, the joined server, and an error if one exists.
 // NOTE: the joined server can be "-" if the config file is being added for the init node.
-func (p *Planner) addConfigFile(nodePlan plan.NodePlan, controlPlane *rkev1.RKEControlPlane, entry *planEntry, tokensSecret plan.Secret,
+func (p *Planner) addConfigFile(nodePlan plan.NodePlan, controlPlane *rkev1.RKEControlPlane, cluster *capi.Cluster, entry *planEntry, tokensSecret plan.Secret,
 	joinServer string, reg registries, renderS3 bool) (plan.NodePlan, map[string]interface{}, string, error) {
 	config := map[string]interface{}{}
 
@@ -744,13 +879,14 @@ func (p *Planner) addConfigFile(nodePlan plan.NodePlan, controlPlane *rkev1.RKEC
 		return nodePlan, config, "", fmt.Errorf("implausible joined server for entry")
 	}
 
+	addRKE2Prime(config, controlPlane, entry)
 	addLocalClusterAuthenticationEndpointConfig(config, controlPlane, entry)
 	addToken(config, entry, tokensSecret)
 
 	if err := addAddresses(p.secretCache, config, entry); err != nil {
 		return nodePlan, config, joinedServer, err
 	}
-	if err := addLabels(config, entry); err != nil {
+	if err := addLabels(config, cluster, entry); err != nil {
 		return nodePlan, config, joinedServer, err
 	}
 	if err := addTaints(config, entry, controlPlane); err != nil {
@@ -835,4 +971,47 @@ func (p *Planner) addConfigFile(nodePlan plan.NodePlan, controlPlane *rkev1.RKEC
 	})
 
 	return nodePlan, config, joinedServer, nil
+}
+
+func extractConfigJSON(extractedConfig string) (map[string]interface{}, error) {
+	result := map[string]interface{}{}
+
+	configBytes, err := base64.StdEncoding.DecodeString(extractedConfig)
+	if err != nil {
+		return nil, fmt.Errorf("error reinitializing config (base64.DecodeString): %v", err)
+	}
+
+	gzipReader, err := gzip.NewReader(bytes.NewReader(configBytes))
+	if err != nil {
+		return nil, err
+	}
+	tarReader := tar.NewReader(gzipReader)
+
+	for {
+		header, err := tarReader.Next()
+		if err != nil {
+			if err == io.EOF {
+				return result, nil
+			}
+			return nil, fmt.Errorf("error reinitializing config (tarRead.Next): %v", err)
+		}
+
+		info := header.FileInfo()
+		if info.IsDir() {
+			continue
+		}
+
+		filename := header.Name
+		if strings.Contains(filename, "/machines/") && strings.HasSuffix(filename, "/config.json") {
+			buf := &bytes.Buffer{}
+			_, err = io.Copy(buf, tarReader)
+			if err != nil {
+				return nil, fmt.Errorf("error reinitializing config (Copy): %v", err)
+			}
+
+			if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+				return nil, errors.Wrap(err, "failed to read config.json")
+			}
+		}
+	}
 }

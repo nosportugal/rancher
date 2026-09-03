@@ -23,12 +23,9 @@ import (
 	"github.com/rancher/rancher/pkg/provisioningv2/kubeconfig"
 	"github.com/rancher/rancher/pkg/settings"
 	"github.com/rancher/rancher/pkg/wrangler"
-
-	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/condition"
 	corecontrollers "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/v3/pkg/generic"
-	"github.com/rancher/wrangler/v3/pkg/genericcondition"
 	"github.com/rancher/wrangler/v3/pkg/kstatus"
 	"github.com/rancher/wrangler/v3/pkg/name"
 	"github.com/rancher/wrangler/v3/pkg/randomtoken"
@@ -67,6 +64,7 @@ var (
 type handler struct {
 	mgmtClusterCache      mgmtcontrollers.ClusterCache
 	mgmtClusters          mgmtcontrollers.ClusterController
+	mgmtNodesCache        mgmtcontrollers.NodeCache
 	clusterTokenCache     mgmtcontrollers.ClusterRegistrationTokenCache
 	clusterTokens         mgmtcontrollers.ClusterRegistrationTokenClient
 	featureCache          mgmtcontrollers.FeatureCache
@@ -77,15 +75,14 @@ type handler struct {
 	rkeControlPlanesCache rkecontrollers.RKEControlPlaneCache
 	secretCache           corecontrollers.SecretCache
 	kubeconfigManager     *kubeconfig.Manager
-	apply                 apply.Apply
 
 	capiClustersCache capicontrollers.ClusterCache
-	capiClusters      capicontrollers.ClusterClient
+	capiClusters      capicontrollers.ClusterController
 	capiMachinesCache capicontrollers.MachineCache
 }
 
 func handlerWithoutCAPI(clients *wrangler.Context, kubeconfigManager *kubeconfig.Manager) *handler {
-	return &handler{
+	h := &handler{
 		mgmtClusterCache:      clients.Mgmt.Cluster().Cache(),
 		mgmtClusters:          clients.Mgmt.Cluster(),
 		clusterTokenCache:     clients.Mgmt.ClusterRegistrationToken().Cache(),
@@ -98,10 +95,13 @@ func handlerWithoutCAPI(clients *wrangler.Context, kubeconfigManager *kubeconfig
 		rkeControlPlanesCache: clients.RKE.RKEControlPlane().Cache(),
 		secretCache:           clients.Core.Secret().Cache(),
 		kubeconfigManager:     kubeconfigManager,
-		apply: clients.Apply.WithCacheTypes(
-			clients.Provisioning.Cluster(),
-			clients.Mgmt.Cluster()),
 	}
+
+	if features.MCM.Enabled() {
+		h.mgmtNodesCache = clients.Mgmt.Node().Cache()
+	}
+
+	return h
 }
 
 func EarlyRegister(ctx context.Context, clients *wrangler.Context, kubeconfigManager *kubeconfig.Manager) {
@@ -147,6 +147,12 @@ func EarlyRegister(ctx context.Context, clients *wrangler.Context, kubeconfigMan
 	clients.Provisioning.Cluster().OnChange(ctx, "v1-scheduling-customization-backfill", h.updateV1SchedulingCustomization)
 	clients.Mgmt.Cluster().OnChange(ctx, "v3-scheduling-customization-backfill", h.updateV3SchedulingCustomization)
 
+	clients.Mgmt.Cluster().OnChange(ctx, "management-cluster-status-update", h.updateClusterStatus)
+	clients.DeferredCAPIRegistration.DeferFunc(func(capiClients *wrangler.CAPIContext) {
+		h.capiMachinesCache = capiClients.CAPI.Machine().Cache()
+	})
+
+	// For every mgmt.Cluster reconciliation, trigger the corresponding prov.Cluster
 	relatedresource.Watch(ctx, "cluster-watch", h.clusterWatch,
 		clients.Provisioning.Cluster(), clients.Mgmt.Cluster())
 }
@@ -172,9 +178,10 @@ func Register(
 		capiMachinesCache: clients.CAPI.Machine().Cache(),
 
 		kubeconfigManager: kubeconfigManager,
-		apply: clients.Apply.WithCacheTypes(
-			clients.Provisioning.Cluster(),
-			clients.Mgmt.Cluster()),
+	}
+
+	if features.MCM.Enabled() {
+		h.mgmtNodesCache = clients.Mgmt.Node().Cache()
 	}
 
 	clients.Mgmt.Cluster().OnRemove(ctx, "mgmt-cluster-remove", h.OnMgmtClusterRemove)
@@ -357,6 +364,22 @@ func (h *handler) generateProvisioningClusterFromLegacyCluster(cluster *v3.Clust
 		}
 	}
 
+	if cluster.Spec.WebhookDeploymentCustomization != nil {
+		wdc := cluster.Spec.WebhookDeploymentCustomization.DeepCopy()
+		provCluster.Spec.WebhookDeploymentCustomization = &v1.WebhookDeploymentCustomization{
+			ReplicaCount:                 wdc.ReplicaCount,
+			AppendTolerations:            wdc.AppendTolerations,
+			OverrideAffinity:             wdc.OverrideAffinity,
+			OverrideResourceRequirements: wdc.OverrideResourceRequirements,
+		}
+		if wdc.PodDisruptionBudget != nil {
+			provCluster.Spec.WebhookDeploymentCustomization.PodDisruptionBudget = &v1.PodDisruptionBudgetSpec{
+				MinAvailable:   wdc.PodDisruptionBudget.MinAvailable,
+				MaxUnavailable: wdc.PodDisruptionBudget.MaxUnavailable,
+			}
+		}
+	}
+
 	return []runtime.Object{
 		provCluster,
 	}, status, nil
@@ -506,9 +529,10 @@ func (h *handler) createNewCluster(cluster *v1.Cluster, status v1.ClusterStatus,
 	spec.EnableNetworkPolicy = cluster.Spec.EnableNetworkPolicy
 	spec.DesiredAgentImage = image.ResolveWithCluster(settings.AgentImage.Get(), cluster)
 	spec.DesiredAuthImage = image.ResolveWithCluster(settings.AuthImage.Get(), cluster)
+	spec.DesiredAssetsImage = image.ResolveWithCluster(settings.AssetsImage.Get(), cluster)
 
-	spec.ClusterSecrets.PrivateRegistrySecret = image.GetPrivateRepoSecretFromCluster(cluster)
-	spec.ClusterSecrets.PrivateRegistryURL = image.GetPrivateRepoURLFromCluster(cluster)
+	spec.ClusterSecrets.PrivateRegistrySecret, _ = image.GetPrivateRepoSecretFromCluster(cluster)
+	spec.ClusterSecrets.PrivateRegistryURL, _ = image.GetPrivateRepoURLFromCluster(cluster)
 
 	spec.AgentEnvVars = nil
 	for _, env := range cluster.Spec.AgentEnvVars {
@@ -532,6 +556,22 @@ func (h *handler) createNewCluster(cluster *v1.Cluster, status v1.ClusterStatus,
 			AppendTolerations:            fleetAgentCustomizationCopy.AppendTolerations,
 			OverrideAffinity:             fleetAgentCustomizationCopy.OverrideAffinity,
 			OverrideResourceRequirements: fleetAgentCustomizationCopy.OverrideResourceRequirements,
+		}
+	}
+
+	if cluster.Spec.WebhookDeploymentCustomization != nil {
+		wdc := cluster.Spec.WebhookDeploymentCustomization.DeepCopy()
+		spec.WebhookDeploymentCustomization = &v3.WebhookDeploymentCustomization{
+			ReplicaCount:                 wdc.ReplicaCount,
+			AppendTolerations:            wdc.AppendTolerations,
+			OverrideAffinity:             wdc.OverrideAffinity,
+			OverrideResourceRequirements: wdc.OverrideResourceRequirements,
+		}
+		if wdc.PodDisruptionBudget != nil {
+			spec.WebhookDeploymentCustomization.PodDisruptionBudget = &v3.PodDisruptionBudgetSpec{
+				MinAvailable:   wdc.PodDisruptionBudget.MinAvailable,
+				MaxUnavailable: wdc.PodDisruptionBudget.MaxUnavailable,
+			}
 		}
 	}
 
@@ -665,38 +705,10 @@ func (h *handler) updateStatus(objs []runtime.Object, cluster *v1.Cluster, statu
 	if err != nil && !apierror.IsNotFound(err) {
 		return nil, status, err
 	} else if err == nil {
-		if condition.Cond("Ready").IsTrue(existing) {
+		// Create crtbs only after downstream cluster connection is established to avoid cluster not found errors.
+		// Can no longer use Ready as Ready reflects provisioning cluster status and provisioning cluster is not ready until the crtbs are created, which creates a catch-22.
+		if condition.Cond("Connected").IsTrue(existing) {
 			ready = true
-		}
-		for _, messageCond := range existing.Status.Conditions {
-			if messageCond.Type == "Updated" || messageCond.Type == "Provisioned" || messageCond.Type == "Removed" || (cluster.Spec.RKEConfig != nil && messageCond.Type == "Ready") {
-				// Don't copy these conditions from v3 management object to the v1 provisioning object. This is because we copy these specific conditions from other places and we need to prevent clobbering.
-				// Updated - This is copied from the rkecontrolplane Ready condition to the v1 object by the rke2/provisioningcluster/controller.go via the reconcile function
-				// Provisioned - This is copied from the rkecontrolplane Ready condition to the v1 object by the rke2/provisioningcluster/controller.go via the reconcile function
-				// Removed - This is copied from the rkecontrolplane Removed condition on rkecontrolplane deletion.
-				// Ready - Conditionally, if RKEConfig != nil. This is copied from the rkecontrolplane Ready condition (if cluster is not stable) or v3/management cluster Ready condition (if cluster is stable) by the rke2/provisioningcluster/controller.go via the reconcile function
-				continue
-			}
-
-			found := false
-			newCond := genericcondition.GenericCondition{
-				Type:               string(messageCond.Type),
-				Status:             messageCond.Status,
-				LastUpdateTime:     messageCond.LastUpdateTime,
-				LastTransitionTime: messageCond.LastTransitionTime,
-				Reason:             messageCond.Reason,
-				Message:            messageCond.Message,
-			}
-			for i, provCond := range status.Conditions {
-				if provCond.Type != string(messageCond.Type) {
-					continue
-				}
-				found = true
-				status.Conditions[i] = newCond
-			}
-			if !found {
-				status.Conditions = append(status.Conditions, newCond)
-			}
 		}
 		status.AgentDeployed = v3.ClusterConditionAgentDeployed.IsTrue(existing)
 	}

@@ -3,16 +3,17 @@ package k3sbasedupgrade
 import (
 	"context"
 	"fmt"
+	"path"
 	"reflect"
 	"strings"
 	"time"
 
 	mgmtv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	clusterutils "github.com/rancher/rancher/pkg/cluster"
 	"github.com/rancher/rancher/pkg/controllers/management/clusterdeploy"
 	"github.com/rancher/rancher/pkg/controllers/management/importedclusterversionmanagement"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/nodesyncer"
 	planClientset "github.com/rancher/rancher/pkg/generated/clientset/versioned/typed/upgrade.cattle.io/v1"
-	"github.com/rancher/rancher/pkg/settings"
 	planv1 "github.com/rancher/system-upgrade-controller/pkg/apis/upgrade.cattle.io/v1"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,13 +33,13 @@ func (h *handler) deployPlans(cluster *mgmtv3.Cluster) error {
 	)
 	switch {
 	case cluster.Status.Driver == mgmtv3.ClusterDriverRke2:
-		upgradeImage = settings.PrefixPrivateRegistry(rke2upgradeImage)
+		upgradeImage = path.Join(clusterutils.GetPrivateRegistryURL(cluster), rke2upgradeImage)
 		masterPlanName = rke2MasterPlanName
 		workerPlanName = rke2WorkerPlanName
 		Version = cluster.Spec.Rke2Config.Version
 		strategy = cluster.Spec.Rke2Config.ClusterUpgradeStrategy
 	case cluster.Status.Driver == mgmtv3.ClusterDriverK3s:
-		upgradeImage = settings.PrefixPrivateRegistry(k3supgradeImage)
+		upgradeImage = path.Join(clusterutils.GetPrivateRegistryURL(cluster), k3supgradeImage)
 		masterPlanName = k3sMasterPlanName
 		workerPlanName = k3sWorkerPlanName
 		Version = cluster.Spec.K3sConfig.Version
@@ -187,6 +188,7 @@ func (h *handler) modifyClusterCondition(cluster *mgmtv3.Cluster, masterPlan, wo
 	// implement a simple state machine
 	// UpgradedTrue => GenericUpgrading =>  MasterPlanUpgrading || WorkerPlanUpgrading =>  UpgradedTrue
 
+	var err error
 	cluster = cluster.DeepCopy()
 	if masterPlan.Name == "" && workerPlan.Name == "" {
 		if importedclusterversionmanagement.Enabled(cluster) {
@@ -194,7 +196,7 @@ func (h *handler) modifyClusterCondition(cluster *mgmtv3.Cluster, masterPlan, wo
 			if mgmtv3.ClusterConditionUpgraded.IsTrue(cluster) {
 				mgmtv3.ClusterConditionUpgraded.Unknown(cluster)
 				mgmtv3.ClusterConditionUpgraded.Message(cluster, "cluster is being upgraded")
-				return h.clusterClient.Update(cluster)
+				return h.clusterClient.UpdateStatus(cluster)
 			}
 			if mgmtv3.ClusterConditionUpgraded.IsUnknown(cluster) {
 				// remain in upgrading state if we are passed empty plans
@@ -206,7 +208,11 @@ func (h *handler) modifyClusterCondition(cluster *mgmtv3.Cluster, masterPlan, wo
 			// After the plans are removed, indicated by both plans being empty, the cluster's upgrade condition should be set to true.
 			if mgmtv3.ClusterConditionUpgraded.IsUnknown(cluster) {
 				cluster = upgradeDone(cluster)
-				return h.clusterClient.Update(cluster)
+				cluster, err = h.clusterClient.UpdateStatus(cluster)
+				if err != nil {
+					return cluster, err
+				}
+				return h.forceDeployIfACEEnabled(cluster)
 			}
 		}
 	}
@@ -236,7 +242,6 @@ func (h *handler) modifyClusterCondition(cluster *mgmtv3.Cluster, masterPlan, wo
 
 	var (
 		isMasterPlanVersionNewer, isWorkerPlanVersionNewer bool
-		err                                                error
 	)
 	if masterPlan.Name != "" && masterPlan.Spec.Version != "" {
 		isMasterPlanVersionNewer, err = nodesyncer.IsNewerVersion(cluster.Status.Version.GitVersion, masterPlan.Spec.Version)
@@ -260,17 +265,31 @@ func (h *handler) modifyClusterCondition(cluster *mgmtv3.Cluster, masterPlan, wo
 	// if we made it this far nothing is applying
 	// see k3supgrade_handler also
 	cluster = upgradeDone(cluster)
-	return h.clusterClient.Update(cluster)
+	cluster, err = h.clusterClient.UpdateStatus(cluster)
+	if err != nil {
+		return cluster, err
+	}
+	return h.forceDeployIfACEEnabled(cluster)
 }
 
 func upgradeDone(cluster *mgmtv3.Cluster) *mgmtv3.Cluster {
 	mgmtv3.ClusterConditionUpgraded.True(cluster)
 	mgmtv3.ClusterConditionUpgraded.Message(cluster, "")
-	if cluster.Spec.LocalClusterAuthEndpoint.Enabled {
-		// If ACE is enabled, then force a re-deployment of the cluster-agent and kube-api-auth
-		cluster.Annotations[clusterdeploy.AgentForceDeployAnn] = "true"
-	}
 	return cluster
+}
+
+// forceDeployIfACEEnabled sets the AgentForceDeployAnn annotation and persists it
+// via Update() if ACE is enabled. This is done separately from UpdateStatus()
+// because Update() persists metadata while UpdateStatus() persists status.
+func (h *handler) forceDeployIfACEEnabled(cluster *mgmtv3.Cluster) (*mgmtv3.Cluster, error) {
+	if !cluster.Spec.LocalClusterAuthEndpoint.Enabled {
+		return cluster, nil
+	}
+	if cluster.Annotations == nil {
+		cluster.Annotations = make(map[string]string)
+	}
+	cluster.Annotations[clusterdeploy.AgentForceDeployAnn] = "true"
+	return h.clusterClient.Update(cluster)
 }
 
 func upgradingMessage(concurrency int, nodes []string) string {
@@ -293,6 +312,6 @@ func (h *handler) enqueueOrUpdate(cluster *mgmtv3.Cluster, upgradeMessage string
 	}
 
 	mgmtv3.ClusterConditionUpgraded.Message(cluster, upgradeMessage)
-	return h.clusterClient.Update(cluster)
+	return h.clusterClient.UpdateStatus(cluster)
 
 }

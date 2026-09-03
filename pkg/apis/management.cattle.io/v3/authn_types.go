@@ -50,8 +50,20 @@ type Token struct {
 
 // Implement the TokenAccessor interface
 
+func (t *Token) GetLabels() map[string]string {
+	return t.ObjectMeta.Labels
+}
+
 func (t *Token) GetName() string {
 	return t.ObjectMeta.Name
+}
+
+func (t *Token) GetFullName() string {
+	return t.ObjectMeta.Name
+}
+
+func (t *Token) GetKind() string {
+	return "v3"
 }
 
 func (t *Token) GetIsEnabled() bool {
@@ -459,6 +471,18 @@ type AzureADConfig struct {
 	ApplicationSecret     string `json:"applicationSecret,omitempty" norman:"required,type=password"`
 	RancherURL            string `json:"rancherUrl,omitempty" norman:"required,notnullable"`
 	GroupMembershipFilter string `json:"groupMembershipFilter,omitempty"`
+
+	// EndSessionEndpoint overrides the Azure AD end_session_endpoint used for SSO logout.
+	// If empty, defaults to {Endpoint}/{TenantID}/oauth2/v2.0/logout.
+	EndSessionEndpoint string `json:"endSessionEndpoint,omitempty"`
+
+	// LogoutAllEnabled enables SSO logout (RP-Initiated Logout) for this provider.
+	// Can be set only if AuthConfig.LogoutAllSupported is true.
+	LogoutAllEnabled bool `json:"logoutAllEnabled,omitempty"`
+
+	// LogoutAllForced, when set, makes SSO logout the only accepted logout path.
+	// Requires LogoutAllEnabled to be true.
+	LogoutAllForced bool `json:"logoutAllForced,omitempty"`
 }
 
 type AzureADConfigTestOutput struct {
@@ -638,6 +662,25 @@ type SamlConfig struct {
 	UIDField           string `json:"uidField"           norman:"required"`
 	RancherAPIHost     string `json:"rancherApiHost"     norman:"required"`
 	EntityID           string `json:"entityID"`
+
+	// NameIDFormat is the SAML NameID format the SP requests in the AuthnRequest.
+	// Consumed by the generic SAML provider only. Empty defaults to "unspecified".
+	// +optional
+	NameIDFormat string `json:"nameIDFormat,omitempty" norman:"type=enum,options=unspecified|emailAddress|transient|persistent"`
+
+	// SignatureMethod is the XML signature algorithm the SP uses to sign requests.
+	// Consumed by the generic SAML provider only. Empty defaults to "RSA-SHA256".
+	// +optional
+	SignatureMethod string `json:"signatureMethod,omitempty" norman:"type=enum,options=RSA-SHA256|RSA-SHA1|RSA-SHA512"`
+
+	// AllowIdpInitiated enables IdP-initiated SSO. Consumed by the generic SAML provider only.
+	// +optional
+	AllowIdpInitiated bool `json:"allowIdpInitiated,omitempty"`
+
+	// ForceAuthn, when set true, requests that the IdP force re-authentication.
+	// Consumed by the generic SAML provider only.
+	// +optional
+	ForceAuthn *bool `json:"forceAuthn,omitempty"`
 }
 
 type SamlConfigTestInput struct {
@@ -676,6 +719,11 @@ type OKTAConfig struct {
 type ShibbolethConfig struct {
 	SamlConfig     `json:",inline" mapstructure:",squash"`
 	OpenLdapConfig LdapFields `json:"openLdapConfig"`
+}
+
+// GenericSAMLConfig is the config for the generic, configurable SAML 2.0 auth provider.
+type GenericSAMLConfig struct {
+	SamlConfig `json:",inline" mapstructure:",squash"`
 }
 
 type AuthSystemImages struct {
@@ -732,6 +780,11 @@ type OIDCConfig struct {
 	// RancherAPIHost should be the base URL for accessing Rancher through the
 	// web. e.g. https://rancher.example.com.
 	RancherAPIHost string `json:"rancherApiHost"`
+
+	// clientAuthenticatedSearch indicates that we should search with the
+	// client/secret rather than the user credentials if the underlying provider
+	// supports this.
+	ClientAuthenticatedSearch bool `json:"clientAuthenticatedSearch"`
 }
 
 type OIDCTestOutput struct {
@@ -742,10 +795,6 @@ type OIDCApplyInput struct {
 	OIDCConfig OIDCConfig `json:"oidcConfig,omitempty"`
 	Code       string     `json:"code,omitempty"`
 	Enabled    bool       `json:"enabled,omitempty"`
-}
-
-type KeyCloakOIDCConfig struct {
-	OIDCConfig `json:",inline" mapstructure:",squash"`
 }
 
 // +genclient
@@ -777,6 +826,11 @@ type GenericOIDCTestOutput struct {
 // the configuration for the OIDC provider as well as an auth code.
 type GenericOIDCApplyInput struct {
 	OIDCApplyInput `json:",inline" mapstructure:",squash"`
+}
+
+// KeyCloakOIDCConfig is the wrapper for the Generic OIDC provider to hold the OIDC Configuration
+type KeyCloakOIDCConfig struct {
+	OIDCConfig `json:",inline" mapstructure:",squash"`
 }
 
 // GenericOIDCConfig is a wrapper for the AWS Cognito provider holding the OIDC Configuration

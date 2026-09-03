@@ -1,10 +1,12 @@
 package saml
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/crewjam/saml"
 	"github.com/pkg/errors"
@@ -33,6 +35,7 @@ const (
 	KeyCloakName        = "keycloak"
 	OKTAName            = "okta"
 	ShibbolethName      = "shibboleth"
+	GenericSAMLName     = "genericsaml"
 	loginAction         = "login"
 	testAndEnableAction = "testAndEnable"
 )
@@ -49,27 +52,37 @@ type Provider struct {
 	groupType       string
 	clientState     ClientState
 	ldapProvider    common.AuthProvider
+	userSearcher    *common.UserSearcher
 	sloEnabled      bool
 	sloForced       bool
+
+	getSamlConfig  func() (*apiv3.SamlConfig, error)
+	assertionStore assertionStore
 }
 
 var SamlProviders = make(map[string]*Provider)
 
-func Configure(mgmtCtx *config.ScaledContext, userMGR user.Manager, tokenMGR *tokens.Manager, name string) common.AuthProvider {
+func Configure(ctx context.Context, mgmtCtx *config.ScaledContext, userMGR user.Manager, tokenMGR *tokens.Manager, name string) common.AuthProvider {
 	provider := &Provider{
-		authConfigs: mgmtCtx.Management.AuthConfigs(""),
-		secrets:     mgmtCtx.Wrangler.Core.Secret(),
-		samlTokens:  mgmtCtx.Management.SamlTokens(""),
-		userMGR:     userMGR,
-		tokenMGR:    tokenMGR,
-		name:        name,
-		userType:    name + "_user",
-		groupType:   name + "_group",
+		authConfigs:  mgmtCtx.Management.AuthConfigs(""),
+		secrets:      mgmtCtx.Wrangler.Core.Secret(),
+		samlTokens:   mgmtCtx.Management.SamlTokens(""),
+		userMGR:      userMGR,
+		tokenMGR:     tokenMGR,
+		name:         name,
+		userType:     name + "_user",
+		groupType:    name + "_group",
+		userSearcher: common.NewUserSearcher(mgmtCtx.Management.Users("").Controller().Lister()),
 	}
-
+	provider.getSamlConfig = provider.getSamlConfigFromUnstructured
 	if provider.hasLdapGroupSearch() {
 		provider.ldapProvider = ldap.Configure(mgmtCtx, userMGR, tokenMGR, name)
 	}
+
+	logrus.Debugf("SAML: Using ConfigMap assertion store for %v", name)
+	store := newConfigMapIDStore(mgmtCtx.Wrangler.Core.ConfigMap(), mgmtCtx.Wrangler.Core.ConfigMap().Cache())
+	provider.assertionStore = store
+	go store.cleanUpExpiredAssertionIDs(ctx, time.Tick(time.Minute))
 
 	SamlProviders[name] = provider
 	return provider
@@ -97,6 +110,8 @@ func (s *Provider) TransformToAuthProvider(authConfig map[string]any) (map[strin
 		p[publicclient.OKTAProviderFieldRedirectURL] = formSamlRedirectURLFromMap(authConfig, s.name)
 	case ShibbolethName:
 		p[publicclient.ShibbolethProviderFieldRedirectURL] = formSamlRedirectURLFromMap(authConfig, s.name)
+	case GenericSAMLName:
+		p[publicclient.GenericSAMLProviderFieldRedirectURL] = formSamlRedirectURLFromMap(authConfig, s.name)
 	}
 	return p, nil
 }
@@ -113,12 +128,10 @@ func (s *Provider) Logout(w http.ResponseWriter, r *http.Request, token accessor
 
 	provider, ok := SamlProviders[providerName]
 	if !ok {
-		logrus.Debugf("SAML [logout]: Rancher provider resource `%v` not configured at all", providerName)
 		return fmt.Errorf("SAML [logout]: Rancher provider resource `%v` not configured at all", providerName)
 	}
 
 	if provider.sloForced {
-		logrus.Debugf("SAML [logout]: Rancher provider resource `%v` configured for forced SLO, rejecting regular logout", providerName)
 		return fmt.Errorf("SAML [logout]: Rancher provider resource `%v` configured for forced SLO, rejecting regular logout", providerName)
 	}
 
@@ -132,12 +145,10 @@ func (s *Provider) LogoutAll(w http.ResponseWriter, r *http.Request, token acces
 
 	provider, ok := SamlProviders[providerName]
 	if !ok {
-		logrus.Debugf("SAML [logout-all]: Rancher provider resource `%v` not configured at all", providerName)
 		return fmt.Errorf("SAML [logout-all]: Rancher provider resource `%v` not configured at all", providerName)
 	}
 
 	if !provider.sloEnabled {
-		logrus.Debugf("SAML [logout-all]: Rancher provider resource `%v` not configured for SLO", providerName)
 		return fmt.Errorf("SAML [logout-all]: Rancher provider resource `%v` not configured for SLO", providerName)
 	}
 
@@ -161,8 +172,14 @@ func (s *Provider) LogoutAll(w http.ResponseWriter, r *http.Request, token acces
 	userAtProvider := usernames[0]
 	finalRedirectURL := authLogout.FinalRedirectURL
 
+	validatedRedirectURL, err := validateFinalRedirectURL(finalRedirectURL, provider.serviceProvider.MetadataURL.String())
+	if err != nil {
+		logrus.Errorf("SAML [LogoutAll]: validating redirect URL: %v", err)
+		return newInvalidURLError("failed to logout")
+	}
+
 	provider.clientState.SetPath(provider.serviceProvider.SloURL.Path)
-	provider.clientState.SetState(w, r, "Rancher_FinalRedirectURL", finalRedirectURL)
+	provider.clientState.SetState(w, r, "Rancher_FinalRedirectURL", validatedRedirectURL)
 	provider.clientState.SetState(w, r, "Rancher_Action", "logout-all")
 
 	idpRedirectURL, err := provider.HandleSamlLogout(userAtProvider, w, r)
@@ -182,13 +199,26 @@ func (s *Provider) LogoutAll(w http.ResponseWriter, r *http.Request, token acces
 	return json.NewEncoder(w).Encode(data)
 }
 
-func PerformSamlLogin(r *http.Request, w http.ResponseWriter, name string, input any) error {
+func newInvalidURLError(msg string) error {
+	return httperror.NewAPIError(httperror.ErrorCode{Code: "Invalid redirect URL", Status: http.StatusBadRequest}, msg)
+}
+
+func PerformSamlLogin(r *http.Request, w http.ResponseWriter, name string, input any, commonProvider common.AuthProvider) error {
 	// input will contain the FINAL redirect URL
 	login, ok := input.(*apiv3.SamlLoginInput)
 	if !ok {
 		return errors.New("unexpected input type")
 	}
-	finalRedirectURL := login.FinalRedirectURL
+	provider, ok := commonProvider.(*Provider)
+	if !ok {
+		return errors.New("unexpected provider type")
+	}
+
+	finalRedirectURL, err := validateFinalRedirectURL(login.FinalRedirectURL, provider.serviceProvider.MetadataURL.String())
+	if err != nil {
+		logrus.Errorf("SAML [PerformSamlLogin]: validating redirect URL: %v", err)
+		return newInvalidURLError("failed to login")
+	}
 
 	logrus.Debugf("SAML [PerformSamlLogin]: Id Provider            (%v)", name)
 
@@ -232,7 +262,7 @@ func PerformSamlLogin(r *http.Request, w http.ResponseWriter, name string, input
 	return nil
 }
 
-func (s *Provider) getSamlConfig() (*apiv3.SamlConfig, error) {
+func (s *Provider) getSamlConfigFromUnstructured() (*apiv3.SamlConfig, error) {
 	authConfigObj, err := s.authConfigs.ObjectClient().UnstructuredClient().Get(s.name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("SAML: failed to retrieve SamlConfig, error: %v", err)
@@ -285,6 +315,8 @@ func (s *Provider) saveSamlConfig(config *apiv3.SamlConfig) error {
 		configType = client.OKTAConfigType
 	case ShibbolethName:
 		configType = client.ShibbolethConfigType
+	case GenericSAMLName:
+		configType = client.GenericSAMLConfigType
 	}
 
 	config.APIVersion = "management.cattle.io/v3"
@@ -348,10 +380,17 @@ func (s *Provider) RefetchGroupPrincipals(principalID string, secret string) ([]
 	return nil, errors.New("Not implemented")
 }
 
+func (s *Provider) UsesUserSecrets() bool      { return false }
+func (s *Provider) CanRefreshPrincipals() bool { return s.name == ShibbolethName }
+
 // SearchPrincipals searches for a principal by name using LDAP if configured.
-// Otherwise it returns a "fake" principal of a requested type with the name as the searchKey.
+// Otherwise it returns the users Rancher already knows about whose display name
+// or username matches the searchKey, followed by a principal of the requested
+// type holding the searchKey itself.
 // If the principalType is empty, both user and group principals are returned.
-// This is done because SAML, in the absence of LDAP, doesn't have a user/group lookup mechanism.
+// This is done because SAML, in the absence of LDAP, doesn't have a user/group
+// lookup mechanism, so that last principal lets an admin enter an external ID by
+// hand for an identity Rancher has not seen yet.
 func (s *Provider) SearchPrincipals(searchKey, principalType string, token accessor.TokenAccessor) ([]apiv3.Principal, error) {
 	if s.hasLdapGroupSearch() {
 		principals, err := s.ldapProvider.SearchPrincipals(searchKey, principalType, token)
@@ -364,13 +403,19 @@ func (s *Provider) SearchPrincipals(searchKey, principalType string, token acces
 	var principals []apiv3.Principal
 
 	if principalType != common.GroupPrincipalType {
-		principals = append(principals, apiv3.Principal{
+		fromSearchKey := apiv3.Principal{
 			ObjectMeta:    metav1.ObjectMeta{Name: s.userType + "://" + searchKey},
 			DisplayName:   searchKey,
 			LoginName:     searchKey,
 			PrincipalType: common.UserPrincipalType,
 			Provider:      s.name,
-		})
+		}
+
+		users, err := common.PrincipalsWithFallback(s.userSearcher, s.name, searchKey, fromSearchKey)
+		if err != nil {
+			return nil, err
+		}
+		principals = append(principals, users...)
 	}
 
 	if principalType != common.UserPrincipalType {
@@ -445,6 +490,8 @@ func formSamlRedirectURLFromMap(config map[string]any, name string) string {
 		hostname, _ = config[client.OKTAConfigFieldRancherAPIHost].(string)
 	case ShibbolethName:
 		hostname, _ = config[client.ShibbolethConfigFieldRancherAPIHost].(string)
+	case GenericSAMLName:
+		hostname, _ = config[client.GenericSAMLConfigFieldRancherAPIHost].(string)
 	}
 
 	path := hostname + "/v1-saml/" + name + "/login"

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/capr"
 	corev1 "k8s.io/api/core/v1"
 	apierror "k8s.io/apimachinery/pkg/api/errors"
@@ -21,45 +22,70 @@ const (
 	headerPrefix    = "X-Cattle-"
 )
 
-func (r *RKE2ConfigServer) findMachineByClusterToken(req *http.Request) (string, string, error) {
+func (r *RKE2ConfigServer) findMachineByClusterToken(req *http.Request) (*corev1.ObjectReference, error) {
 	token := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
 	if token == "" {
-		return "", "", nil
+		return nil, nil
 	}
 
 	machineID := req.Header.Get(machineIDHeader)
 	if machineID == "" {
-		return "", "", nil
+		return nil, nil
 	}
 
-	tokens, err := r.clusterTokenCache.GetByIndex(tokenIndex, token)
+	secrets, err := r.secretsCache.GetByIndex(crtTokenIndex, token)
 	if err != nil {
-		return "", "", err
+		return nil, err
+	}
+
+	if len(secrets) == 0 {
+		return nil, nil
 	}
 
 	data := dataFromHeaders(req)
 
-	if len(tokens) == 0 {
-		return "", "", nil
+	namespace := secrets[0].Namespace
+
+	lc, err := ResolveMgmtTokenCaller(r.mgmtClusterCache, r.capiClusterCache, namespace)
+	if err != nil {
+		return nil, err
 	}
 
-	secretName := machineRequestSecretName(machineID)
-	secret, err := r.secretsCache.Get(tokens[0].Namespace, secretName)
+	secretName := machineRequestSecretName(lc.Kind, machineID)
+	secret, err := r.secretsCache.Get(namespace, secretName)
 	if apierror.IsNotFound(err) {
-		secret, err = r.createSecret(tokens[0].Namespace, secretName, data)
+		secret, err = r.createSecret(namespace, secretName, data)
 	}
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 
 	secret, err = r.waitReady(secret)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 
 	machineNamespace, machineName := secret.Labels[capr.MachineNamespaceLabel], secret.Labels[capr.MachineNameLabel]
 	_ = r.secrets.Delete(secret.Namespace, secret.Name, nil)
-	return machineNamespace, machineName, nil
+
+	switch lc.Kind {
+	case KindImported:
+		return &corev1.ObjectReference{
+			APIVersion: v3.SchemeGroupVersion.String(),
+			Kind:       "Node",
+			Namespace:  machineNamespace,
+			Name:       machineName,
+		}, nil
+	case KindCAPINative, KindV2Prov:
+		return &corev1.ObjectReference{
+			APIVersion: capi.GroupVersion.String(),
+			Kind:       "Machine",
+			Namespace:  machineNamespace,
+			Name:       machineName,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("unknown caller kind %v", lc.Kind)
 }
 
 func (r *RKE2ConfigServer) findMachineByID(machineID, ns string) (*capi.Machine, error) {
@@ -126,9 +152,18 @@ func (r *RKE2ConfigServer) waitReady(secret *corev1.Secret) (*corev1.Secret, err
 	return nil, fmt.Errorf("timeout waiting for %s/%s to be ready", secret.Namespace, secret.Name)
 }
 
-func machineRequestSecretName(name string) string {
+func machineRequestSecretName(kind CallerKind, name string) string {
 	hash := sha256.Sum256([]byte(name))
-	return "custom-" + hex.EncodeToString(hash[:])[:12]
+	var prefix string
+	switch kind {
+	case KindImported:
+		prefix = "imported-"
+	case KindCAPINative:
+		prefix = "capi-"
+	default:
+		prefix = "custom-"
+	}
+	return prefix + hex.EncodeToString(hash[:])[:12]
 }
 
 func dataFromHeaders(req *http.Request) map[string]interface{} {

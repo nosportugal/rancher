@@ -8,15 +8,16 @@ import (
 	"fmt"
 
 	"github.com/rancher/rancher/pkg/auth/providerrefresh"
+	"github.com/rancher/rancher/pkg/auth/providers/common"
 	"github.com/rancher/rancher/pkg/auth/userretention"
 	mgmtcontrollers "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
 	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/types/config"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/oauth2"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
 )
 
 const (
@@ -76,22 +77,33 @@ func (c *UserAttributeController) sync(key string, attribs *v3.UserAttribute) (r
 		return attribs, nil
 	}
 
+	if _, ok := attribs.Annotations[common.ProviderRefreshErrorAnnotation]; ok {
+		logrus.Debugf("Skipping provider refresh for %s: annotated with non-transient error", name)
+		attribs.NeedsRefresh = false
+		updated, uerr := c.userAttributes.Update(attribs)
+		if uerr != nil {
+			return nil, fmt.Errorf("error clearing NeedsRefresh for skipped user %s: %w", name, uerr)
+		}
+		return updated, nil
+	}
+
 	attribs, err = c.providerRefresh(attribs)
 	if err != nil {
-		var retrieveErr *oauth2.RetrieveError
-		// Stop retrying if the token has expired.
-		if errors.As(err, &retrieveErr) {
-			if retrieveErr.ErrorCode == "invalid_grant" {
-				logrus.Warnf("Token has expired. UserAttributes won't be refreshed until the user %s logs in. Error message: %s", name, err)
-				return nil, nil
-			}
+		var nte *common.NonTransientError
+		if errors.As(err, &nte) {
+			return c.skipRefresh(name, err)
 		}
+
 		return nil, fmt.Errorf("error refreshing user attribute %s: %w", name, err)
 	}
 
 	updated, err := c.userAttributes.Update(attribs)
 	if err == nil {
 		return updated, nil
+	}
+
+	if apierrors.IsRequestEntityTooLargeError(err) {
+		return c.skipRefresh(name, err)
 	}
 
 	// We deliberately wrap and shadow the original error so that we can return it later on.
@@ -119,4 +131,42 @@ func (c *UserAttributeController) sync(key string, attribs *v3.UserAttribute) (r
 	}
 
 	return updated, nil
+}
+
+// skipRefresh annotates the UserAttribute with the error so future refreshes
+// are skipped until the user logs in again.
+func (c *UserAttributeController) skipRefresh(name string, reason error) (runtime.Object, error) {
+	logrus.Warnf("Skipping provider refresh for %s due to non-transient error: %v", name, reason)
+
+	// Re-fetch from the API server inside the retry: gets a clean version
+	// (important for the 413 case where the in-memory attribs may contain
+	// bloated GroupPrincipals) and keeps the ResourceVersion fresh so the
+	// annotation write doesn't lose to a concurrent trigger or consumer
+	// writeback under contention.
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		attribs, err := c.userAttributes.Get(name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			// The user attribute was deleted under us.
+			// The annotation would have no reader. No point in requeuing.
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if attribs.Annotations == nil {
+			attribs.Annotations = make(map[string]string)
+		}
+		attribs.Annotations[common.ProviderRefreshErrorAnnotation] = reason.Error()
+		attribs.NeedsRefresh = false
+		_, err = c.userAttributes.Update(attribs)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error annotating user attribute %s to skip refresh: %w", name, err)
+	}
+
+	return nil, nil
 }

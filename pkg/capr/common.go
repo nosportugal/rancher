@@ -43,8 +43,10 @@ import (
 )
 
 const (
-	AddressAnnotation = "rke.cattle.io/address"
-	ClusterNameLabel  = "rke.cattle.io/cluster-name"
+	AddressAnnotation                      = "rke.cattle.io/address"
+	BootstrapTokenLastAccessTimeAnnotation = "rke.cattle.io/last-access-timestamp"
+	BootstrapTokenAnnotation               = "rke.cattle.io/bootstrap-token"
+	ClusterNameLabel                       = "rke.cattle.io/cluster-name"
 	// ClusterSpecAnnotation is used to define the cluster spec used to generate the rkecontrolplane object as an annotation on the object
 	ClusterSpecAnnotation                      = "rke.cattle.io/cluster-spec"
 	ControlPlaneRoleLabel                      = "rke.cattle.io/control-plane-role"
@@ -57,6 +59,7 @@ const (
 	InitNodeLabel                              = "rke.cattle.io/init-node"
 	InitNodeMachineIDLabel                     = "rke.cattle.io/init-node-machine-id"
 	InternalAddressAnnotation                  = "rke.cattle.io/internal-address"
+	InvalidatedBootstrapTokenAnnotation        = "rke.cattle.io/bootstrap-token-invalidated"
 	JoinURLAutosetDisabled                     = "rke.cattle.io/join-url-autoset-disabled"
 	JoinURLAnnotation                          = "rke.cattle.io/join-url"
 	JoinedToAnnotation                         = "rke.cattle.io/joined-to"
@@ -77,17 +80,23 @@ const (
 	UnCordonAnnotation                         = "rke.cattle.io/uncordon"
 	WorkerRoleLabel                            = "rke.cattle.io/worker-role"
 	AuthorizedObjectAnnotation                 = "rke.cattle.io/object-authorized-for-clusters"
-	PlanUpdatedTimeAnnotation                  = "rke.cattle.io/plan-last-updated"
-	PlanProbesPassedAnnotation                 = "rke.cattle.io/plan-probes-passed"
 	DeleteMissingCustomMachinesAfterAnnotation = "rke.cattle.io/delete-missing-custom-machines-after"
 
-	SnapshotNameAnnotation = "etcdsnapshot.rke.io/snapshot-name"
+	SnapshotNameAnnotation      = "etcdsnapshot.rke.io/snapshot-name"
+	SnapshotTokenHashAnnotation = "rke.cattle.io/snapshot-token-hash"
 
 	JoinServerImplausible = "implausible"
 
 	SecretTypeMachinePlan  = "rke.cattle.io/machine-plan"
 	SecretTypeClusterState = "rke.cattle.io/cluster-state"
 	SecretTypeBootstrap    = "rke.cattle.io/bootstrap"
+
+	// CAPIClusterOwnerLabel and CAPIClusterOwnerNSLabel are stamped by rancher-turtles on the
+	// mgmtv3.Cluster shell that represents an imported CAPI cluster. Presence of both labels
+	// (with non-empty values) identifies a CAPI-native caller; the values point at the real
+	// CAPI Cluster.
+	CAPIClusterOwnerLabel   = "cluster-api.cattle.io/capi-cluster-owner"
+	CAPIClusterOwnerNSLabel = "cluster-api.cattle.io/capi-cluster-owner-ns"
 
 	MachineTemplateClonedFromGroupVersionAnn = "rke.cattle.io/cloned-from-group-version"
 	MachineTemplateClonedFromKindAnn         = "rke.cattle.io/cloned-from-kind"
@@ -121,7 +130,7 @@ const (
 	// Used on: provisioning.cattle.io/v1 Cluster, rke.cattle.io/v1 RKEControlPlane
 	Provisioned = condition.Cond("Provisioned")
 
-	// Stable indicates whether we can safely copy the v3 management cluster Ready condition to the v1 object.
+	// Stable indicates whether we can safely copy the Ready condition to the management.cluster.cattle.io/v3 cluster.
 	// Used on: rke.cattle.io/v1 RKEControlPlane
 	Stable = condition.Cond("Stable")
 
@@ -183,6 +192,13 @@ const (
 	// ClusterAutoscalerPausedAnnotation is an annotation used to pause cluster autoscaling for a cluster
 	// it triggers a scale-down of the cluster-autoscaler chart in the downstream cluster
 	ClusterAutoscalerPausedAnnotation = "provisioning.cattle.io/cluster-autoscaler-paused"
+
+	// RKE2PrimeEnabledAnnotation is a per-cluster annotation that overrides the global
+	// rke2-provisioning-prime-default setting. When explicitly set to "true" or "false", it takes
+	// precedence over the global setting. If absent, the global setting applies.
+	// On upgrade, existing RKE2 clusters receive this annotation set to "false" so their behavior
+	// is unchanged.
+	RKE2PrimeEnabledAnnotation = "provisioning.cattle.io/rke2-prime-enabled"
 
 	RuntimeK3S  = "k3s"
 	RuntimeRKE2 = "rke2"
@@ -366,6 +382,12 @@ func GetSystemAgentDataDir(spec *rkev1.ClusterConfiguration) string {
 
 func IsOwnedByMachine(bootstrapCache rkecontroller.RKEBootstrapCache, machineName string, sa *corev1.ServiceAccount) (bool, error) {
 	for _, owner := range sa.OwnerReferences {
+		// CAPI-native path (turtles-imported clusters): the plan SA is owned directly by the
+		// CAPI Machine — there is no RKEBootstrap in the chain.
+		if owner.Kind == "Machine" && owner.Name == machineName {
+			return true, nil
+		}
+		// v2prov path: planSA → RKEBootstrap → CAPI Machine.
 		if owner.Kind == RKEBootstrapKind {
 			bootstrap, err := bootstrapCache.Get(sa.Namespace, owner.Name)
 			if err != nil {
@@ -584,6 +606,8 @@ func GetOwnerCAPIMachineSet(obj runtime.Object, cache capicontrollers.MachineSet
 // If the object is nil, it cannot access to object or type metas, the owner reference Kind or APIVersion do not match,
 // or the object could not be found, it returns an ErrNoMatchingControllerOwnerRef error.
 // If the owner reference exists and is valid, it will return the owner reference and the namespace it belongs to.
+// This function is resilient to CAPI v1.13.1+ changes where the controller flag may not be set on owner references.
+// It will first try to find a controller-flagged owner reference, and if that fails, fall back to matching by kind and apiVersion.
 func GetOwnerFromGVK(groupVersion, kind string, obj runtime.Object) (*metav1.OwnerReference, string, error) {
 	if obj == nil {
 		return nil, "", errNilObject
@@ -592,11 +616,23 @@ func GetOwnerFromGVK(groupVersion, kind string, obj runtime.Object) (*metav1.Own
 	if err != nil {
 		return nil, "", err
 	}
+
+	// find the controller-flagged owner reference
 	ref := metav1.GetControllerOf(objMeta)
-	if ref == nil || ref.Kind != kind || ref.APIVersion != groupVersion {
-		return nil, "", ErrNoMatchingControllerOwnerRef
+	if ref != nil && ref.Kind == kind && ref.APIVersion == groupVersion {
+		return ref, objMeta.GetNamespace(), nil
 	}
-	return ref, objMeta.GetNamespace(), nil
+
+	// Fallback: search for an owner reference that matches by kind and apiVersion
+	for _, owner := range objMeta.GetOwnerReferences() {
+		if owner.Kind == kind &&
+			owner.APIVersion == groupVersion {
+			ownerCopy := owner
+			return &ownerCopy, objMeta.GetNamespace(), nil
+		}
+	}
+
+	return nil, "", ErrNoMatchingControllerOwnerRef
 }
 
 // SafeConcatName takes a maximum length and set of strings, it returns a string

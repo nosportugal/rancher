@@ -206,7 +206,11 @@ func providerInputForType(providerType string) loginAccessor {
 			GenericLogin: apiv3.GenericLogin{Type: providerType, Name: saml.ShibbolethName},
 		}
 		// isSAMLProvider = true
-	case client.GoogleOAuthProviderType:
+	case client.GenericSAMLProviderType:
+		return &apiv3.SamlLoginInput{
+			GenericLogin: apiv3.GenericLogin{Type: providerType, Name: saml.GenericSAMLName},
+		}
+	case client.GoogleOAuthProviderType, "googleOauthProvider":
 		return &apiv3.GoogleOauthLogin{
 			GenericLogin: apiv3.GenericLogin{Type: providerType, Name: googleoauth.Name},
 		}
@@ -238,10 +242,20 @@ func (h *loginHandler) login(w http.ResponseWriter, r *http.Request, input login
 		return
 	}
 
+	if input.GetName() == local.Name && providers.IsLocalHidden() {
+		util.ReturnAPIError(w, httperror.NewAPIError(httperror.NotFound, ""))
+		return
+	}
+
 	if providers.IsSAMLProviderType(input.GetType()) {
 		// SAML's login flow is different. Unlike other providers it gets the logged in user's data
 		// via the POST from the identity provider on a separate endpoint.
-		err := saml.PerformSamlLogin(r, w, input.GetName(), input)
+		p, err := providers.GetProvider(input.GetName())
+		if err != nil {
+			util.ReturnAPIError(w, err)
+			return
+		}
+		err = saml.PerformSamlLogin(r, w, input.GetName(), input, p)
 		if err != nil {
 			if !util.IsAPIError(err) {
 				logrus.Errorf("login: Error performing SAML login: %s", err)
@@ -348,6 +362,9 @@ func (h *loginHandler) login(w http.ResponseWriter, r *http.Request, input login
 			Secure:   true,
 			Path:     "/",
 			HttpOnly: true,
+			// Lax is the default in most browsers; setting it
+			// explicitly is a good security measure.
+			SameSite: http.SameSiteLaxMode,
 		}
 		http.SetCookie(w, tokenCookie)
 

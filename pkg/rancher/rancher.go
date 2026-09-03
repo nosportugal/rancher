@@ -106,10 +106,15 @@ type Options struct {
 	AuditLogMaxbackup              int
 	AuditLogLevel                  int
 	AuditLogEnabled                bool
+	AuditLogExcludeGroups          bool
 	Features                       string
 	ClusterRegistry                string
 	AggregationRegistrationTimeout time.Duration
 	RancherNamespaceOptions        string
+
+	// LocalUserPasswordsNamespace should be set to true if the namespace for
+	// storing user passwords should be created.
+	LocalUserPasswordsNamespace bool
 }
 
 type Rancher struct {
@@ -169,11 +174,6 @@ func New(ctx context.Context, clientConfg clientcmd.ClientConfig, opts *Options)
 		return nil, err
 	}
 
-	// Check for deprecated RKE1 resources in the cluster
-	if err := validateRKE1Resources(wranglerContext); err != nil {
-		return nil, fmt.Errorf("rke1 pre-upgrade validation failed: %w", err)
-	}
-
 	if err := dashboarddata.EarlyData(ctx, wranglerContext.K8s); err != nil {
 		return nil, err
 	}
@@ -222,6 +222,14 @@ func New(ctx context.Context, clientConfg clientcmd.ClientConfig, opts *Options)
 		return nil, fmt.Errorf("failed to create CRDs: %w", err)
 	}
 
+	// Disable the linode node driver (if unused) and remove its DynamicSchema
+	// objects and generated CRDs before any informers start.
+	if features.MCM.Enabled() && features.ProvisioningV2.Enabled() {
+		if err := disableUnusedLinodeNodeDriver(wranglerContext); err != nil {
+			return nil, fmt.Errorf("failed to reconcile linode node driver: %w", err)
+		}
+	}
+
 	if features.MCM.Enabled() && !features.Fleet.Enabled() {
 		logrus.Info("fleet can't be turned off when MCM is enabled. Turning on fleet feature")
 		if err := features.SetFeature(wranglerContext.Mgmt.Feature(), features.Fleet.Name(), true); err != nil {
@@ -229,35 +237,28 @@ func New(ctx context.Context, clientConfg clientcmd.ClientConfig, opts *Options)
 		}
 	}
 
-	if features.Auth.Enabled() {
-		sc, err := config.NewScaledContext(*restConfig, nil)
-		if err != nil {
-			return nil, err
-		}
+	sc, err := config.NewScaledContext(*restConfig, nil)
+	if err != nil {
+		return nil, err
+	}
 
-		sc.Wrangler = wranglerContext
+	sc.Wrangler = wranglerContext
 
-		sc.UserManager, err = common.NewUserManagerNoBindings(wranglerContext)
-		if err != nil {
-			return nil, err
-		}
+	sc.UserManager, err = common.NewUserManagerNoBindings(wranglerContext)
+	if err != nil {
+		return nil, err
+	}
 
-		sc.ClientGetter, err = normanStoreProxy.NewClientGetterFromConfig(*restConfig)
-		if err != nil {
-			return nil, err
-		}
+	sc.ClientGetter, err = normanStoreProxy.NewClientGetterFromConfig(*restConfig)
+	if err != nil {
+		return nil, err
+	}
 
-		tokenAuthenticator := requests.NewAuthenticator(ctx, clusterrouter.GetClusterID, sc)
+	tokenAuthenticator := requests.NewAuthenticator(ctx, clusterrouter.GetClusterID, sc)
 
-		authServer, err = auth.NewServer(ctx, wranglerContext, sc, tokenAuthenticator)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		authServer, err = auth.NewAlwaysAdmin()
-		if err != nil {
-			return nil, err
-		}
+	authServer, err = auth.NewServer(ctx, wranglerContext, sc, tokenAuthenticator)
+	if err != nil {
+		return nil, err
 	}
 
 	if !features.Turtles.Enabled() {
@@ -296,9 +297,8 @@ func New(ctx context.Context, clientConfg clientcmd.ClientConfig, opts *Options)
 		Controllers:     steveControllers,
 		AccessSetLookup: wranglerContext.ASL,
 		AuthMiddleware:  steveauth.ExistingContext,
-		Next:            ui.New(wranglerContext.Mgmt.Preference().Cache(), wranglerContext.Mgmt.ClusterRegistrationToken().Cache()),
+		Next:            ui.New(wranglerContext.Mgmt.Preference().Cache(), wranglerContext.Core.Secret().Cache()),
 		ClusterRegistry: opts.ClusterRegistry,
-		SQLCache:        features.UISQLCache.Enabled(),
 		SQLCacheFactoryOptions: factory.CacheFactoryOptions{
 			GCInterval:  gcInterval,
 			GCKeepCount: gcKeepCount,
@@ -343,6 +343,7 @@ func New(ctx context.Context, clientConfg clientcmd.ClientConfig, opts *Options)
 		auditLogWriter, err = audit.NewWriter(out, audit.WriterOptions{
 			DefaultPolicyLevel:     auditlogv1.Level(opts.AuditLogLevel),
 			DisableDefaultPolicies: !opts.AuditLogEnabled,
+			ExcludeGroups:          opts.AuditLogExcludeGroups,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create audit log writer: %w", err)
@@ -443,7 +444,7 @@ func getSQLCacheGCValues(wranglerContext *wrangler.Context) (time.Duration, int)
 }
 
 func (r *Rancher) Start(ctx context.Context) error {
-	if features.MCM.Enabled() {
+	if r.opts.LocalUserPasswordsNamespace {
 		// ensure namespace for storing local users password is created
 		if _, err := r.Wrangler.Core.Namespace().Create(&v1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: pbkdf2.LocalUserPasswordsNamespace},
@@ -492,7 +493,17 @@ func (r *Rancher) Start(ctx context.Context) error {
 			return errors.New("dashboard.Register() failed: " + err.Error())
 		}
 
-		return runMigrations(r.Wrangler)
+		if err := runMigrations(r.Wrangler); err != nil {
+			return err
+		}
+
+		if err := r.Wrangler.StartFactoryWithTransaction(ctx, func(ctx context.Context) error {
+			dashboard.RegisterPostMigration(ctx, r.Wrangler)
+			return nil
+		}); err != nil {
+			return errors.New("dashboard.RegisterPostMigration() failed: " + err.Error())
+		}
+		return nil
 	})
 
 	r.Wrangler.OnLeaderOrDie("rancher-start::DefferedCAPIRegistration", func(ctx context.Context) error {
@@ -785,12 +796,22 @@ func setupRancherService(ctx context.Context, restConfig *rest.Config, httpsList
 	return nil
 }
 
+// effectiveWebhookVersion will return the resolved webhook version similar to `settingsProvider`
+// This is a thin stop-gap for resolving the version before the providers are ready to use.
+func effectiveWebhookVersion() string {
+	v := os.Getenv(settings.GetEnvKey(settings.RancherWebhookVersion.Name))
+	if v == "" {
+		v = settings.RancherWebhookVersion.Get()
+	}
+	return v
+}
+
 // bumpRancherServiceVersion bumps the version of rancher-webhook if it is detected that the version is less than
 // v0.2.2-alpha1. This is because the version of rancher-webhook less than v0.2.2-alpha1 does not support Kubernetes v1.22+
 // This should only be called when Rancher is run in a Docker container because the Kubernetes version and Rancher version
 // are bumped at the same time. In a Kubernetes cluster, usually the Rancher version is bumped when the cluster is upgraded.
 func bumpRancherWebhookIfNecessary(ctx context.Context, restConfig *rest.Config) error {
-	v := os.Getenv("CATTLE_RANCHER_WEBHOOK_VERSION")
+	v := effectiveWebhookVersion()
 	webhookVersionParts := strings.Split(v, "+up")
 	if len(webhookVersionParts) != 2 {
 		return nil
@@ -901,67 +922,4 @@ func migrateEncryptionConfig(ctx context.Context, restConfig *rest.Config) error
 		allErrors = errors.Join(err, allErrors)
 	}
 	return allErrors
-}
-
-// checks for deprecated RKE1 resources in the cluster to ensure that the cluster is not using any deprecated resources.
-func validateRKE1Resources(wranglerContext *wrangler.Context) error {
-	resources, err := checkForRKE1Resources(wranglerContext)
-	if err != nil {
-		return fmt.Errorf("checking for RKE1 resources: %w", err)
-	}
-	if len(resources) == 0 {
-		return nil
-	}
-
-	return fmt.Errorf("Rancher v2.12+ does not support RKE1. Detected RKE1-related resources (listed below).\nPlease migrate these clusters to RKE2 or K3s, or delete the related resources. More info: https://www.suse.com/c/rke-end-of-life-by-july-2025-replatform-to-rke2-or-k3s/\n - %s", strings.Join(resources, "\n - "))
-}
-
-// checkForRKE1Resources scans for deprecated RKE1 (Rancher Kubernetes Engine v1) resources in the Rancher management context.
-func checkForRKE1Resources(wranglerContext *wrangler.Context) ([]string, error) {
-	var found []string
-
-	logrus.Infof("Scanning NodeTemplates in namespace: %s, group: nodetemplates.management.cattle.io", namespace.NodeTemplateGlobalNamespace)
-	logrus.Infof("Scanning ClusterTemplates in namespace: %s, group: clustertemplates.management.cattle.io", namespace.GlobalNamespace)
-
-	// Check for RKE1 clusters
-	clusters, err := wranglerContext.Mgmt.Cluster().List(metav1.ListOptions{})
-	if apierrors.IsNotFound(err) {
-		clusters = &v3.ClusterList{}
-	} else if err != nil {
-		return nil, fmt.Errorf("error checking RKE1 clusters: %w", err)
-	}
-
-	for _, cluster := range clusters.Items {
-		if cluster.Spec.RancherKubernetesEngineConfig != nil {
-			found = append(found, fmt.Sprintf("Cluster: name=%s, displayName=%s", cluster.Name, cluster.Spec.DisplayName))
-		}
-	}
-
-	// NodeTemplates in the global node template namespace
-	nodeTemplates, err := wranglerContext.Mgmt.NodeTemplate().List(namespace.NodeTemplateGlobalNamespace, metav1.ListOptions{})
-
-	if apierrors.IsNotFound(err) {
-		nodeTemplates = &v3.NodeTemplateList{}
-	} else if err != nil {
-		return nil, fmt.Errorf("error checking nodeTemplates: %w", err)
-	}
-
-	for _, obj := range nodeTemplates.Items {
-		found = append(found, fmt.Sprintf("NodeTemplate: name=%s, displayName=%s", obj.Name, obj.Spec.DisplayName))
-	}
-
-	// ClusterTemplates in the global namespace
-	clusterTemplates, err := wranglerContext.Mgmt.ClusterTemplate().List(namespace.GlobalNamespace, metav1.ListOptions{})
-
-	if apierrors.IsNotFound(err) {
-		clusterTemplates = &v3.ClusterTemplateList{}
-	} else if err != nil {
-		return nil, fmt.Errorf("error checking clusterTemplates: %w", err)
-	}
-
-	for _, obj := range clusterTemplates.Items {
-		found = append(found, fmt.Sprintf("ClusterTemplate: name=%s, displayName=%s", obj.Name, obj.Spec.DisplayName))
-	}
-
-	return found, nil
 }

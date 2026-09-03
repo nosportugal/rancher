@@ -48,7 +48,6 @@ const (
 	rtbLabelUpdated                  = "authz.cluster.cattle.io/rtb-label-updated"
 	rtbCrbRbLabelsUpdated            = "authz.cluster.cattle.io/crb-rb-labels-updated"
 	rtByInheritedRTsIndex            = "authz.cluster.cattle.io/rts-by-inherited-rts"
-	impersonationLabel               = "authz.cluster.cattle.io/impersonator"
 
 	rolesCircularSoftLimit = 100
 	rolesCircularHardLimit = 500
@@ -139,7 +138,7 @@ func Register(ctx context.Context, workload *config.UserContext) error {
 	management.Management.Projects(workload.ClusterName).AddClusterScopedLifecycle(ctx, "project-namespace-auth", workload.ClusterName, newProjectLifecycle(r, workload.Corew.Secret()))
 	workload.RBACw.ClusterRole().OnChange(ctx, "cluster-clusterrole-sync", newClusterRoleHandler(r).sync)
 	workload.RBACw.ClusterRoleBinding().OnChange(ctx, "legacy-crb-cleaner-sync", newLegacyCRBCleaner(r).sync)
-	management.Management.Clusters("").AddHandler(ctx, "global-admin-cluster-sync", newClusterHandler(workload))
+	management.Wrangler.Mgmt.Cluster().OnChange(ctx, "global-admin-cluster-sync", newClusterHandler(workload))
 	management.Management.GlobalRoleBindings("").AddHandler(ctx, grbHandlerName, newGlobalRoleBindingHandler(workload))
 
 	sync := &resourcequota.SyncController{
@@ -163,6 +162,21 @@ func Register(ctx context.Context, workload *config.UserContext) error {
 	}
 	relatedresource.WatchClusterScoped(ctx, "enqueue-namespaces-by-roletemplate", nsEnqueuer.RoleTemplateEnqueueNamespace, workload.Corew.Namespace(), management.Wrangler.Mgmt.RoleTemplate())
 
+	// Re-evaluate a namespace's InitialRolesPopulated condition when the project RBAC it waits for
+	// appears: PRTB-owned RoleBindings (project-member access) and project-namespace ClusterRoles.
+	// ClusterRoleBindings don't have a similar watch, but will be caught by the 5 second retry timer in the InitialRolesPopulated condition handler.
+	relatedresource.WatchClusterScoped(ctx, "enqueue-namespace-by-rolebinding", roleBindingEnqueueNamespace, workload.Corew.Namespace(), workload.RBACw.RoleBinding())
+	relatedresource.WatchClusterScoped(ctx, "enqueue-namespace-by-clusterrole", clusterRoleEnqueueNamespace, workload.Corew.Namespace(), workload.RBACw.ClusterRole())
+
+	// Create the Roles and RoleBindings that GlobalRoles with InheritedNamespacedRules define for
+	// namespaces created after the GlobalRole. The GlobalRole and GlobalRoleBinding controllers run
+	// on the leader replica and cannot be enqueued from here: this namespace watch runs on the
+	// replica that owns the cluster, which in HA is usually a different pod, so the resources are
+	// reconciled for this cluster directly.
+	RegisterInheritedNamespacedRulesHandler(ctx, workload.Corew.Namespace(),
+		management.Wrangler.Mgmt.GlobalRole(), management.Wrangler.Mgmt.GlobalRoleBinding(),
+		workload.RBACw.Role(), workload.RBACw.RoleBinding(), workload.ClusterName)
+
 	// Register roletemplate-aggregation controllers
 	if err := roletemplates.Register(ctx, workload); err != nil {
 		return fmt.Errorf("registering role template controllers: %w", err)
@@ -172,6 +186,14 @@ func Register(ctx context.Context, workload *config.UserContext) error {
 	management.Management.ProjectRoleTemplateBindings("").AddClusterScopedLifecycle(ctx, "cluster-prtb-sync", workload.ClusterName, newPRTBLifecycle(r, management, nsInformer))
 	management.Management.ClusterRoleTemplateBindings("").AddClusterScopedLifecycle(ctx, "cluster-crtb-sync", workload.ClusterName, newCRTBLifecycle(r, management))
 	management.Management.RoleTemplates("").AddHandler(ctx, "cluster-roletemplate-sync", newRTLifecycle(r))
+
+	// Register owner-side enqueuers so that editing a RoleTemplate re-triggers the non-aggregated
+	// cluster-prtb-sync / cluster-crtb-sync handlers above. The equivalent enqueuers in
+	// pkg/controllers/management/auth run on the leader plane and only reach the leader-side
+	// management-plane handlers; in HA the owner is a different replica, so these owner-side
+	// enqueuers guarantee the downstream binding reconcile is enqueued on every RoleTemplate change.
+	management.Management.RoleTemplates("").AddHandler(ctx, "cluster-prtb-roletemplate-enqueuer", newPRTBRoleTemplateEnqueuer(r, management.Management.ProjectRoleTemplateBindings("")))
+	management.Management.RoleTemplates("").AddHandler(ctx, "cluster-crtb-roletemplate-enqueuer", newCRTBRoleTemplateEnqueuer(r, management.Management.ClusterRoleTemplateBindings("")))
 	return nil
 }
 
@@ -203,7 +225,7 @@ type manager struct {
 	rbLister            wrbacv1.RoleBindingCache
 	roleBindings        wrbacv1.RoleBindingClient
 	nsLister            corew.NamespaceCache
-	namespaces          corew.NamespaceClient
+	namespaces          corew.NamespaceController
 	clusterLister       v3.ClusterLister
 	projectLister       v3.ProjectLister
 	userLister          v3.UserLister
@@ -343,19 +365,19 @@ func (m *manager) ensureClusterBindings(roles map[string]*v3.RoleTemplate, bindi
 		}
 	}
 
-	list := func(_ string, selector labels.Selector) ([]interface{}, error) {
+	list := func(_ string, selector labels.Selector) ([]any, error) {
 		currentRBs, err := m.crbLister.List(selector)
 		if err != nil {
 			return nil, err
 		}
-		var items []interface{}
+		var items []any
 		for _, c := range currentRBs {
 			items = append(items, c)
 		}
 		return items, nil
 	}
 
-	convert := func(i interface{}) (string, string, []rbacv1.Subject) {
+	convert := func(i any) (string, string, []rbacv1.Subject) {
 		crb, _ := i.(*rbacv1.ClusterRoleBinding)
 		return crb.Name, crb.RoleRef.Name, crb.Subjects
 	}
@@ -380,19 +402,19 @@ func (m *manager) ensureProjectRoleBindings(ns string, roles map[string]*v3.Role
 		return rb
 	}
 
-	list := func(ns string, selector labels.Selector) ([]interface{}, error) {
+	list := func(ns string, selector labels.Selector) ([]any, error) {
 		currentRBs, err := m.rbLister.List(ns, selector)
 		if err != nil {
 			return nil, err
 		}
-		var items []interface{}
+		var items []any
 		for _, c := range currentRBs {
 			items = append(items, c)
 		}
 		return items, nil
 	}
 
-	convert := func(i interface{}) (string, string, []rbacv1.Subject) {
+	convert := func(i any) (string, string, []rbacv1.Subject) {
 		rb, _ := i.(*rbacv1.RoleBinding)
 		return rb.Name, rb.RoleRef.Name, rb.Subjects
 	}
@@ -409,8 +431,8 @@ func (m *manager) ensureProjectRoleBindings(ns string, roles map[string]*v3.Role
 type deleteFn func(name string) error
 
 type createFn func(objectMeta metav1.ObjectMeta, subjects []rbacv1.Subject, roleRef rbacv1.RoleRef) runtime.Object
-type listFn func(ns string, selector labels.Selector) ([]interface{}, error)
-type convertFn func(i interface{}) (string, string, []rbacv1.Subject)
+type listFn func(ns string, selector labels.Selector) ([]any, error)
+type convertFn func(i any) (string, string, []rbacv1.Subject)
 
 func (m *manager) ensureBindings(ns string, roles map[string]*v3.RoleTemplate, binding metav1.Object,
 	deleteFunc deleteFn, create createFn, list listFn, convert convertFn) error {
@@ -508,7 +530,7 @@ func bindingParts(namespace, roleName string, objMeta metav1.ObjectMeta, subject
 		roleRef
 }
 
-func prtbByProjectName(obj interface{}) ([]string, error) {
+func prtbByProjectName(obj any) ([]string, error) {
 	prtb, ok := obj.(*v3.ProjectRoleTemplateBinding)
 	if !ok {
 		return []string{}, nil
@@ -532,7 +554,7 @@ func getPRTBProjectAndSubjectKey(prtb *v3.ProjectRoleTemplateBinding) string {
 	return prtb.ProjectName + "." + name
 }
 
-func prtbByProjectAndSubject(obj interface{}) ([]string, error) {
+func prtbByProjectAndSubject(obj any) ([]string, error) {
 	prtb, ok := obj.(*v3.ProjectRoleTemplateBinding)
 	if !ok {
 		return []string{}, nil
@@ -540,7 +562,7 @@ func prtbByProjectAndSubject(obj interface{}) ([]string, error) {
 	return []string{getPRTBProjectAndSubjectKey(prtb)}, nil
 }
 
-func prtbByUID(obj interface{}) ([]string, error) {
+func prtbByUID(obj any) ([]string, error) {
 	prtb, ok := obj.(*v3.ProjectRoleTemplateBinding)
 	if !ok {
 		return []string{}, nil
@@ -548,7 +570,7 @@ func prtbByUID(obj interface{}) ([]string, error) {
 	return []string{convert.ToString(prtb.UID)}, nil
 }
 
-func prtbByNsName(obj interface{}) ([]string, error) {
+func prtbByNsName(obj any) ([]string, error) {
 	prtb, ok := obj.(*v3.ProjectRoleTemplateBinding)
 	if !ok {
 		return []string{}, nil
@@ -568,7 +590,7 @@ func rbRoleSubjectKey(roleName string, subject rbacv1.Subject) string {
 	return subject.Kind + " " + subject.Name + " Role " + roleName
 }
 
-func crbByRoleAndSubject(obj interface{}) ([]string, error) {
+func crbByRoleAndSubject(obj any) ([]string, error) {
 	crb, ok := obj.(*rbacv1.ClusterRoleBinding)
 	if !ok {
 		return []string{}, nil
@@ -576,7 +598,7 @@ func crbByRoleAndSubject(obj interface{}) ([]string, error) {
 	return crbRoleSubjectKeys(crb.RoleRef.Name, crb.Subjects), nil
 }
 
-func rtbByClusterAndRoleTemplateName(obj interface{}) ([]string, error) {
+func rtbByClusterAndRoleTemplateName(obj any) ([]string, error) {
 	var idx string
 	switch rtb := obj.(type) {
 	case *v3.ProjectRoleTemplateBinding:
@@ -598,7 +620,7 @@ func rtbByClusterAndRoleTemplateName(obj interface{}) ([]string, error) {
 	return []string{idx}, nil
 }
 
-func rtByInterhitedRTs(obj interface{}) ([]string, error) {
+func rtByInterhitedRTs(obj any) ([]string, error) {
 	rt, ok := obj.(*wranglerv3.RoleTemplate)
 	if !ok {
 		return nil, fmt.Errorf("failed to convert object to *RoleTemplate in indexer [%s]", rtByInheritedRTsIndex)
@@ -606,7 +628,7 @@ func rtByInterhitedRTs(obj interface{}) ([]string, error) {
 	return rt.RoleTemplateNames, nil
 }
 
-func rtbByClusterAndUserNotDeleting(obj interface{}) ([]string, error) {
+func rtbByClusterAndUserNotDeleting(obj any) ([]string, error) {
 	meta, err := meta.Accessor(obj)
 	if err != nil {
 		return []string{}, err

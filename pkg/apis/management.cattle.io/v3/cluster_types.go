@@ -12,7 +12,6 @@ import (
 	gkev1 "github.com/rancher/gke-operator/pkg/apis/gke.cattle.io/v1"
 	"github.com/rancher/norman/condition"
 	"github.com/rancher/norman/types"
-	rketypes "github.com/rancher/rke/types"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -75,7 +74,6 @@ const (
 
 	ClusterDriverImported = "imported"
 	ClusterDriverLocal    = "local"
-	ClusterDriverRKE      = "rancherKubernetesEngine" // Deprecated: RKE clusters are deprecated
 	ClusterDriverK3s      = "k3s"
 	ClusterDriverK3os     = "k3os"
 	ClusterDriverRke2     = "rke2"
@@ -108,20 +106,22 @@ type Cluster struct {
 }
 
 type ClusterSpecBase struct {
-	DesiredAgentImage                                    string                                  `json:"desiredAgentImage"`
-	DesiredAuthImage                                     string                                  `json:"desiredAuthImage"`
-	AgentImageOverride                                   string                                  `json:"agentImageOverride"`
-	AgentEnvVars                                         []v1.EnvVar                             `json:"agentEnvVars,omitempty"`
-	RancherKubernetesEngineConfig                        *rketypes.RancherKubernetesEngineConfig `json:"rancherKubernetesEngineConfig,omitempty"`
-	DefaultPodSecurityAdmissionConfigurationTemplateName string                                  `json:"defaultPodSecurityAdmissionConfigurationTemplateName,omitempty"`
-	DefaultClusterRoleForProjectMembers                  string                                  `json:"defaultClusterRoleForProjectMembers,omitempty" norman:"type=reference[roleTemplate]"`
-	DockerRootDir                                        string                                  `json:"dockerRootDir,omitempty" norman:"default=/var/lib/docker"`
-	EnableNetworkPolicy                                  *bool                                   `json:"enableNetworkPolicy" norman:"default=false"`
-	WindowsPreferedCluster                               bool                                    `json:"windowsPreferedCluster" norman:"noupdate"`
-	LocalClusterAuthEndpoint                             LocalClusterAuthEndpoint                `json:"localClusterAuthEndpoint,omitempty"`
-	ClusterSecrets                                       ClusterSecrets                          `json:"clusterSecrets" norman:"nocreate,noupdate"`
-	ClusterAgentDeploymentCustomization                  *AgentDeploymentCustomization           `json:"clusterAgentDeploymentCustomization,omitempty"`
-	FleetAgentDeploymentCustomization                    *AgentDeploymentCustomization           `json:"fleetAgentDeploymentCustomization,omitempty"`
+	DesiredAgentImage                                    string                          `json:"desiredAgentImage"`
+	DesiredAuthImage                                     string                          `json:"desiredAuthImage"`
+	AgentImageOverride                                   string                          `json:"agentImageOverride"`
+	AgentEnvVars                                         []v1.EnvVar                     `json:"agentEnvVars,omitempty"`
+	DesiredAssetsImage                                   string                          `json:"desiredAssetsImage"`
+	AssetsImageOverride                                  string                          `json:"assetsImageOverride"`
+	DefaultPodSecurityAdmissionConfigurationTemplateName string                          `json:"defaultPodSecurityAdmissionConfigurationTemplateName,omitempty"`
+	DefaultClusterRoleForProjectMembers                  string                          `json:"defaultClusterRoleForProjectMembers,omitempty" norman:"type=reference[roleTemplate]"`
+	DockerRootDir                                        string                          `json:"dockerRootDir,omitempty" norman:"default=/var/lib/docker"`
+	EnableNetworkPolicy                                  *bool                           `json:"enableNetworkPolicy" norman:"default=false"`
+	WindowsPreferedCluster                               bool                            `json:"windowsPreferedCluster" norman:"noupdate"`
+	LocalClusterAuthEndpoint                             LocalClusterAuthEndpoint        `json:"localClusterAuthEndpoint,omitempty"`
+	ClusterSecrets                                       ClusterSecrets                  `json:"clusterSecrets" norman:"nocreate,noupdate"`
+	ClusterAgentDeploymentCustomization                  *AgentDeploymentCustomization   `json:"clusterAgentDeploymentCustomization,omitempty"`
+	FleetAgentDeploymentCustomization                    *AgentDeploymentCustomization   `json:"fleetAgentDeploymentCustomization,omitempty"`
+	WebhookDeploymentCustomization                       *WebhookDeploymentCustomization `json:"webhookDeploymentCustomization,omitempty"`
 }
 
 type AgentDeploymentCustomization struct {
@@ -162,27 +162,24 @@ type ClusterSpec struct {
 	EKSConfig                           *eksv1.EKSClusterConfigSpec `json:"eksConfig,omitempty"`
 	GKEConfig                           *gkev1.GKEClusterConfigSpec `json:"gkeConfig,omitempty"`
 	AliConfig                           *aliv1.AliClusterConfigSpec `json:"aliConfig,omitempty"`
-	ClusterTemplateName                 string                      `json:"clusterTemplateName,omitempty" norman:"type=reference[clusterTemplate],nocreate,noupdate"`
-	ClusterTemplateRevisionName         string                      `json:"clusterTemplateRevisionName,omitempty" norman:"type=reference[clusterTemplateRevision]"`
-	ClusterTemplateAnswers              Answer                      `json:"answers,omitempty"`
-	ClusterTemplateQuestions            []Question                  `json:"questions,omitempty" norman:"nocreate,noupdate"`
 	FleetWorkspaceName                  string                      `json:"fleetWorkspaceName,omitempty"`
 }
 
-type Answer struct {
-	ProjectName     string            `json:"projectName,omitempty" norman:"type=reference[project]"`
-	ClusterName     string            `json:"clusterName,omitempty" norman:"type=reference[cluster]"`
-	Values          map[string]string `json:"values,omitempty"`
-	ValuesSetString map[string]string `json:"valuesSetString,omitempty"`
-}
-
-func (a *Answer) ObjClusterName() string {
-	return a.ClusterName
+// WebhookDeploymentCustomization holds HA and resource configuration for the rancher-webhook deployment.
+type WebhookDeploymentCustomization struct {
+	// ReplicaCount sets the number of webhook pod replicas. The webhook natively supports
+	// multi-replica operation via leader election and shared TLS certificates.
+	ReplicaCount                 *int32                   `json:"replicaCount,omitempty"`
+	AppendTolerations            []v1.Toleration          `json:"appendTolerations,omitempty"`
+	OverrideAffinity             *v1.Affinity             `json:"overrideAffinity,omitempty"`
+	OverrideResourceRequirements *v1.ResourceRequirements `json:"overrideResourceRequirements,omitempty"`
+	PodDisruptionBudget          *PodDisruptionBudgetSpec `json:"podDisruptionBudget,omitempty"`
 }
 
 type ImportedConfig struct {
-	KubeConfig         string `json:"kubeConfig" norman:"type=password"`
-	PrivateRegistryURL string `json:"privateRegistryURL,omitempty"`
+	KubeConfig                 string   `json:"kubeConfig" norman:"type=password"`
+	PrivateRegistryURL         string   `json:"privateRegistryURL,omitempty"`
+	PrivateRegistryPullSecrets []string `json:"privateRegistryPullSecrets,omitempty"`
 }
 
 type ClusterStatus struct {
@@ -194,6 +191,7 @@ type ClusterStatus struct {
 	Driver                     string                    `json:"driver"`
 	Provider                   string                    `json:"provider"`
 	AgentImage                 string                    `json:"agentImage"`
+	AssetsImage                string                    `json:"assetsImage"`
 	AppliedAgentEnvVars        []v1.EnvVar               `json:"appliedAgentEnvVars,omitempty"`
 	AgentFeatures              map[string]bool           `json:"agentFeatures,omitempty"`
 	AuthImage                  string                    `json:"authImage"`
@@ -231,7 +229,34 @@ type ClusterStatus struct {
 	AADClientSecret            string                    `json:"aadClientSecret,omitempty" norman:"nocreate,noupdate"`       // Deprecated: use ClusterSpec.ClusterSecrets.AADClientSecret instead
 	AADClientCertSecret        string                    `json:"aadClientCertSecret,omitempty" norman:"nocreate,noupdate"`   // Deprecated: use ClusterSpec.ClusterSecrets.AADClientCertSecret instead
 
-	AppliedClusterAgentDeploymentCustomization *AgentDeploymentCustomization `json:"appliedClusterAgentDeploymentCustomization,omitempty"`
+	AppliedClusterAgentDeploymentCustomization *AgentDeploymentCustomization   `json:"appliedClusterAgentDeploymentCustomization,omitempty"`
+	AppliedClusterAgentImagePullSecretsHash    string                          `json:"appliedClusterAgentImagePullSecretsHash,omitempty"`
+	AppliedWebhookDeploymentCustomization      *WebhookDeploymentCustomization `json:"appliedWebhookDeploymentCustomization,omitempty"`
+
+	// ReadyReconciling indicates that the cluster's readiness state is currently being managed by provisioning controller.
+	// Currently used only for v2prov clusters. When true, secondary health controllers (like HealthSyncer, Connected) should avoid updating Ready condition to prevent state flapping.
+	ReadyReconciling bool         `json:"readyReconciling,omitempty"`
+	Info             *ClusterInfo `json:"info,omitempty"`
+}
+
+// ClusterInfo provides aggregated cluster metadata for UI display.
+type ClusterInfo struct {
+	// MachineProvider is the infrastructure provider for v2prov (amazonec2, digitalocean, custom) or cluster type (local, imported, aks, eks, gke).
+	MachineProvider string `json:"machineProvider,omitempty"`
+	// KubernetesVersion is the cluster's Kubernetes version, from status.Version.GitVersion or spec if pending.
+	KubernetesVersion string `json:"kubernetesVersion,omitempty"`
+	// NodeCount is the number of nodes. For v2prov clusters it's from CAPI machines, otherwise from status.NodeCount.
+	NodeCount int `json:"nodeCount,omitempty"`
+	// Arch is the node architecture from node labels, or "mixed" if multiple architectures exist.
+	Arch string `json:"arch,omitempty"`
+	// ProvisioningClusterRef is a reference to the provisioning.cattle.io/v1 Cluster. Set only for v2prov clusters.
+	ProvisioningClusterRef *v1.ObjectReference `json:"provisioningClusterRef,omitempty"`
+	/* Other fields UI uses:
+	1. Distro: available in cluster.Status.Provider.
+	2. Human name of the cluster: cluster.Spec.DisplayName
+	3. CPU/Memory/Pod Count: cluster.Status.Capacity
+	4. State: summarized from cluster.Status.Conditions
+	*/
 }
 
 type ClusterComponentStatus struct {
@@ -301,6 +326,11 @@ func (c *ClusterRegistrationToken) ObjClusterName() string {
 
 type ClusterRegistrationTokenSpec struct {
 	ClusterName string `json:"clusterName" norman:"required,type=reference[cluster]"`
+	// TTL is the duration in minutes before the token expires and is rotated. Zero disables TTL-based rotation.
+	TTL *int64 `json:"ttl,omitempty"`
+	// GracePeriod is the duration in minutes during which both the old and new tokens remain valid after
+	// rotation, allowing cluster agents time to restart and pick up the new credential.
+	GracePeriod *int64 `json:"gracePeriod,omitempty"`
 }
 
 func (c *ClusterRegistrationTokenSpec) ObjClusterName() string {
@@ -316,6 +346,9 @@ type ClusterRegistrationTokenStatus struct {
 	InsecureNodeCommand        string `json:"insecureNodeCommand"`
 	ManifestURL                string `json:"manifestUrl"`
 	Token                      string `json:"token"`
+	TokenSecretName            string `json:"tokenSecretName,omitempty"`
+	ExpiresAt                  string `json:"expiresAt,omitempty"`
+	GracePeriodExpiresAt       string `json:"gracePeriodExpiresAt,omitempty"`
 }
 
 type GenerateKubeConfigOutput struct {
@@ -390,16 +423,6 @@ type LocalClusterAuthEndpoint struct {
 
 type CertExpiration struct {
 	ExpirationDate string `json:"expirationDate,omitempty"`
-}
-
-type SaveAsTemplateInput struct {
-	ClusterTemplateName         string `json:"clusterTemplateName,omitempty"`
-	ClusterTemplateRevisionName string `json:"clusterTemplateRevisionName,omitempty"`
-}
-
-type SaveAsTemplateOutput struct {
-	ClusterTemplateName         string `json:"clusterTemplateName,omitempty"`
-	ClusterTemplateRevisionName string `json:"clusterTemplateRevisionName,omitempty"`
 }
 
 type AKSStatus struct {

@@ -37,7 +37,7 @@ func AuthConfigs(management *config.ManagementContext) error {
 		return err
 	}
 
-	if err := addAuthConfig(azure.Name, client.AzureADConfigType, false, management); err != nil {
+	if err := addAuthConfigWithSLO(azure.Name, client.AzureADConfigType, false, management); err != nil {
 		return err
 	}
 
@@ -66,6 +66,10 @@ func AuthConfigs(management *config.ManagementContext) error {
 	}
 
 	if err := addAuthConfigWithSLO(saml.ShibbolethName, client.ShibbolethConfigType, false, management); err != nil {
+		return err
+	}
+
+	if err := addAuthConfigWithSLO(saml.GenericSAMLName, client.GenericSAMLConfigType, false, management); err != nil {
 		return err
 	}
 

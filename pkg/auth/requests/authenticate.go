@@ -19,7 +19,6 @@ import (
 	"github.com/rancher/rancher/pkg/auth/providers"
 	"github.com/rancher/rancher/pkg/auth/providers/common"
 	"github.com/rancher/rancher/pkg/auth/tokens"
-	"github.com/rancher/rancher/pkg/auth/tokens/hashers"
 	exttokenstore "github.com/rancher/rancher/pkg/ext/stores/tokens"
 	"github.com/rancher/rancher/pkg/features"
 	mgmtcontrollers "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
@@ -74,9 +73,11 @@ type ClusterRouter func(req *http.Request) string
 type authorizationTokenClaims struct {
 	jwt.RegisteredClaims
 
-	// Token is a reference to the underlying v3.Token associated with the
-	// authenticated user.
+	// Token is a reference to the underlying ext or v3/legacy Token
+	// associated with the authenticated user.
 	Token string `json:"token"`
+	// Kind is an enum ("v3", "ext") telling us what kind of token we have
+	Kind string `json:"token_kind"`
 }
 
 type tokenAuthenticator struct {
@@ -363,10 +364,14 @@ func (a *tokenAuthenticator) TokenFromRequest(req *http.Request) (accessor.Token
 
 	var tokenClaims *authorizationTokenClaims
 	tokenName, tokenKey := tokens.SplitTokenParts(tokenAuthValue)
+	var inJWTPath bool
+	var isExtToken bool
 	if tokenName == "" || tokenKey == "" {
 		if !features.OIDCProvider.Enabled() {
 			return nil, ErrMustAuthenticate
 		}
+
+		inJWTPath = true
 
 		logrus.Debug("Could not parse tokenName and tokenKey from request - attempting JWT authentication")
 		claims, err := a.parseTokenFromJWT(tokenAuthValue)
@@ -375,37 +380,71 @@ func (a *tokenAuthenticator) TokenFromRequest(req *http.Request) (accessor.Token
 			return nil, ErrMustAuthenticate
 		}
 
-		obj, exists, err := a.tokenIndexer.GetByKey(claims.Token)
-		if err != nil || !exists {
-			logrus.Errorf("Unknown token in OAuth Token: %s", claims.Token)
-			return nil, ErrMustAuthenticate
+		isExtToken = claims.Kind == "ext"
+		if isExtToken {
+			// Detected ext token in OIDC session. Note we do not
+			// have a proper token key to validate, i.e. no token
+			// secret value, and thus will use ExtVerifyTokenWithoutKey
+			// later.
+			tokenName = claims.Token
+			logrus.Debug("Parsed (ext) tokenName from JWT, no TokenKey")
+		} else {
+			// Falling back to legacy token
+			obj, exists, err := a.tokenIndexer.GetByKey(claims.Token)
+			if err != nil || !exists {
+				logrus.Errorf("Unknown token in OAuth Token: %s", claims.Token)
+				return nil, ErrMustAuthenticate
+			}
+
+			token := obj.(*apiv3.Token)
+			tokenName, tokenKey = token.Name, token.Token
+			logrus.Debug("Parsed tokenName and TokenKey from JWT")
 		}
 
-		token := obj.(*apiv3.Token)
-
 		tokenClaims = claims
-		tokenName, tokenKey = token.Name, token.Token
-		logrus.Debug("Parsed tokenName and TokenKey from JWT")
 	}
 
 	logrus.Debugf("TokenFromRequest: Using tokenName %q", tokenName)
 
 	lookupUsingClient := false
 
-	if extTokenName, found := strings.CutPrefix(tokenName, "ext/"); found {
+	if !inJWTPath {
+		extTokenName, isExt := strings.CutPrefix(tokenName, "ext/")
+		isExtToken = isExt
+		if isExt {
+			tokenName = extTokenName
+		}
+	}
+
+	if isExtToken {
 		// Ext token detected. Perform roughly the same process as for legacy tokens, using
 		// a different store.  No indexer/cache in play here.
 
-		storedToken, err := a.extTokenStore.Get(extTokenName, "", &metav1.GetOptions{})
+		if tokenClaims != nil {
+			if err := a.validateOIDCClientForToken(tokenClaims); err != nil {
+				return nil, err
+			}
+		}
+
+		storedToken, err := a.extTokenStore.Get(tokenName, "", &metav1.GetOptions{})
 		if err != nil {
 			if apierrors.IsNotFound(err) {
+				if inJWTPath {
+					logrus.Errorf("Unknown ext token in OAuth Token: %s", tokenName)
+				}
 				return nil, ErrMustAuthenticate
 			}
 			return nil, fmt.Errorf("failed to retrieve auth token, error: %v: %w",
 				err, ErrMustAuthenticate)
 		}
-		if _, err := extVerifyToken(storedToken, extTokenName, tokenKey); err != nil {
-			return nil, fmt.Errorf("failed to verify token: %v: %w", err, ErrMustAuthenticate)
+		if inJWTPath {
+			if _, err := tokens.ExtVerifyTokenWithoutKey(storedToken, tokenName); err != nil {
+				return nil, fmt.Errorf("failed to verify token: %v: %w", err, ErrMustAuthenticate)
+			}
+		} else {
+			if _, err := tokens.ExtVerifyToken(storedToken, tokenName, tokenKey); err != nil {
+				return nil, fmt.Errorf("failed to verify token: %v: %w", err, ErrMustAuthenticate)
+			}
 		}
 
 		return storedToken, nil
@@ -442,10 +481,16 @@ func (a *tokenAuthenticator) TokenFromRequest(req *http.Request) (accessor.Token
 			return nil, err
 		}
 	}
-
-	if _, err := tokens.VerifyToken(storedToken, tokenName, tokenKey); err != nil {
-		logrus.Debugf("auth: Error verifying token %s: %v", tokenName, err)
-		return nil, errors.Wrapf(ErrMustAuthenticate, "failed to verify token: %v", err)
+	if inJWTPath {
+		if _, err := tokens.VerifyTokenWithoutKey(storedToken, tokenName); err != nil {
+			logrus.Debugf("auth: Error verifying token %s: %v", tokenName, err)
+			return nil, errors.Wrapf(ErrMustAuthenticate, "failed to verify token: %v", err)
+		}
+	} else {
+		if _, err := tokens.VerifyToken(storedToken, tokenName, tokenKey); err != nil {
+			logrus.Debugf("auth: Error verifying token %s: %v", tokenName, err)
+			return nil, errors.Wrapf(ErrMustAuthenticate, "failed to verify token: %v", err)
+		}
 	}
 
 	return storedToken, nil
@@ -465,37 +510,4 @@ func (a *tokenAuthenticator) validateOIDCClientForToken(claims *authorizationTok
 	}
 
 	return nil
-}
-
-// Given a stored token with hashed key, check if the provided (unhashed) tokenKey matches and is valid.
-// This must match the logic of [tokens.VerifyToken].
-func extVerifyToken(storedToken *ext.Token, tokenName, tokenKey string) (int, error) {
-	invalidAuthTokenErr := errors.New("invalid token")
-
-	if storedToken == nil || storedToken.ObjectMeta.Name != tokenName {
-		return http.StatusUnprocessableEntity, invalidAuthTokenErr
-	}
-
-	// Ext token always has a hash. Only a hash.
-	hasher, err := hashers.GetHasherForHash(storedToken.Status.Hash)
-	if err != nil {
-		logrus.Errorf("unable to get a hasher for token with error %v", err)
-		return http.StatusInternalServerError,
-			fmt.Errorf("unable to verify hash '%s'", storedToken.Status.Hash)
-	}
-
-	if err := hasher.VerifyHash(storedToken.Status.Hash, tokenKey); err != nil {
-		logrus.Errorf("VerifyHash failed with error: %v", err)
-		return http.StatusUnprocessableEntity, invalidAuthTokenErr
-	}
-
-	if tokens.IsExpired(storedToken) {
-		return http.StatusGone, errors.New("must authenticate, expired")
-	}
-
-	if tokens.IsIdleExpired(storedToken, time.Now()) {
-		return http.StatusGone, errors.New("must authenticate, idle session timeout expired")
-	}
-
-	return http.StatusOK, nil
 }

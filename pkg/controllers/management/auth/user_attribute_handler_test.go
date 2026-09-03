@@ -7,6 +7,7 @@ import (
 
 	management "github.com/rancher/rancher/pkg/apis/management.cattle.io"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/auth/providers/common"
 	"github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -328,4 +329,229 @@ func TestSyncGetUserAttributeFails(t *testing.T) {
 
 	_, err := controller.sync("", attribs)
 	require.Error(t, err)
+}
+
+func TestSyncNonTransientProviderError(t *testing.T) {
+	userID := "u-abcdef"
+	attribs := &v3.UserAttribute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: userID,
+		},
+		NeedsRefresh: true,
+	}
+
+	var lastUpdated *v3.UserAttribute
+
+	ctrl := gomock.NewController(t)
+
+	userAttributeClient := fake.NewMockNonNamespacedControllerInterface[*v3.UserAttribute, *v3.UserAttributeList](ctrl)
+	userAttributeClient.EXPECT().Get(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(func(name string, opts metav1.GetOptions) (*v3.UserAttribute, error) {
+		return attribs.DeepCopy(), nil
+	})
+	userAttributeClient.EXPECT().Update(gomock.Any()).AnyTimes().DoAndReturn(func(ua *v3.UserAttribute) (*v3.UserAttribute, error) {
+		lastUpdated = ua.DeepCopy()
+		return lastUpdated, nil
+	})
+
+	controller := UserAttributeController{
+		userAttributes:            userAttributeClient,
+		ensureUserRetentionLabels: func(attribs *v3.UserAttribute) error { return nil },
+		providerRefresh: func(attribs *v3.UserAttribute) (*v3.UserAttribute, error) {
+			return nil, &common.NonTransientError{Err: fmt.Errorf("user not found")}
+		},
+	}
+
+	obj, err := controller.sync("", attribs)
+	require.NoError(t, err)
+	assert.Nil(t, obj)
+
+	require.NotNil(t, lastUpdated)
+	assert.False(t, lastUpdated.NeedsRefresh)
+	assert.Contains(t, lastUpdated.Annotations, common.ProviderRefreshErrorAnnotation)
+	assert.Contains(t, lastUpdated.Annotations[common.ProviderRefreshErrorAnnotation], "user not found")
+}
+
+func TestSyncNonTransientProviderErrorRetriesOnConflict(t *testing.T) {
+	userID := "u-abcdef"
+	attribs := &v3.UserAttribute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: userID,
+		},
+		NeedsRefresh: true,
+	}
+
+	var (
+		updateAttempts int
+		lastUpdated    *v3.UserAttribute
+	)
+
+	ctrl := gomock.NewController(t)
+
+	userAttributeClient := fake.NewMockNonNamespacedControllerInterface[*v3.UserAttribute, *v3.UserAttributeList](ctrl)
+	userAttributeClient.EXPECT().Get(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(func(name string, opts metav1.GetOptions) (*v3.UserAttribute, error) {
+		return attribs.DeepCopy(), nil
+	})
+	userAttributeClient.EXPECT().Update(gomock.Any()).AnyTimes().DoAndReturn(func(ua *v3.UserAttribute) (*v3.UserAttribute, error) {
+		updateAttempts++
+		if updateAttempts == 1 {
+			return nil, apierrors.NewConflict(
+				schema.GroupResource{Group: management.GroupName, Resource: "userattributes"},
+				userID, fmt.Errorf("the object has been modified"))
+		}
+		lastUpdated = ua.DeepCopy()
+		return lastUpdated, nil
+	})
+
+	controller := UserAttributeController{
+		userAttributes:            userAttributeClient,
+		ensureUserRetentionLabels: func(attribs *v3.UserAttribute) error { return nil },
+		providerRefresh: func(attribs *v3.UserAttribute) (*v3.UserAttribute, error) {
+			return nil, &common.NonTransientError{Err: fmt.Errorf("user not found")}
+		},
+	}
+
+	obj, err := controller.sync("", attribs)
+	require.NoError(t, err)
+	assert.Nil(t, obj)
+
+	assert.Equal(t, 2, updateAttempts, "skipRefresh should retry after a 409 conflict")
+	require.NotNil(t, lastUpdated)
+	assert.False(t, lastUpdated.NeedsRefresh)
+	assert.Contains(t, lastUpdated.Annotations, common.ProviderRefreshErrorAnnotation)
+}
+
+func TestSyncNonTransientProviderErrorIgnoresUserAttributeNotFound(t *testing.T) {
+	userID := "u-abcdef"
+	attribs := &v3.UserAttribute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: userID,
+		},
+		NeedsRefresh: true,
+	}
+
+	ctrl := gomock.NewController(t)
+
+	userAttributeClient := fake.NewMockNonNamespacedControllerInterface[*v3.UserAttribute, *v3.UserAttributeList](ctrl)
+	gets := 0
+	userAttributeClient.EXPECT().Get(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(func(name string, opts metav1.GetOptions) (*v3.UserAttribute, error) {
+		gets++
+		if gets == 1 {
+			// First read is the sync handler's own re-fetch at the top of sync.
+			return attribs.DeepCopy(), nil
+		}
+		// Subsequent read inside skipRefresh's retry: the user attribute is
+		// gone (e.g. the user was deleted while the refresh was in flight).
+		return nil, apierrors.NewNotFound(
+			schema.GroupResource{Group: management.GroupName, Resource: "userattributes"},
+			name)
+	})
+	// No Update expectation: the retry must short-circuit on NotFound.
+
+	controller := UserAttributeController{
+		userAttributes:            userAttributeClient,
+		ensureUserRetentionLabels: func(attribs *v3.UserAttribute) error { return nil },
+		providerRefresh: func(attribs *v3.UserAttribute) (*v3.UserAttribute, error) {
+			return nil, &common.NonTransientError{Err: fmt.Errorf("user not found")}
+		},
+	}
+
+	obj, err := controller.sync("", attribs)
+	require.NoError(t, err, "Must not error when the user attribute is gone")
+	assert.Nil(t, obj)
+}
+
+func TestSyncRequestEntityTooLarge(t *testing.T) {
+	userID := "u-abcdef"
+	attribs := &v3.UserAttribute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: userID,
+		},
+		NeedsRefresh: true,
+	}
+
+	var lastUpdated *v3.UserAttribute
+	var updateCount int
+
+	ctrl := gomock.NewController(t)
+
+	userAttributeClient := fake.NewMockNonNamespacedControllerInterface[*v3.UserAttribute, *v3.UserAttributeList](ctrl)
+	userAttributeClient.EXPECT().Get(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(func(name string, opts metav1.GetOptions) (*v3.UserAttribute, error) {
+		return attribs.DeepCopy(), nil
+	})
+	userAttributeClient.EXPECT().Update(gomock.Any()).AnyTimes().DoAndReturn(func(ua *v3.UserAttribute) (*v3.UserAttribute, error) {
+		updateCount++
+		if updateCount == 1 {
+			return nil, apierrors.NewRequestEntityTooLargeError("limit is 3145728")
+		}
+		lastUpdated = ua.DeepCopy()
+		return lastUpdated, nil
+	})
+
+	now := time.Now().Truncate(time.Second)
+
+	controller := UserAttributeController{
+		userAttributes:            userAttributeClient,
+		ensureUserRetentionLabels: func(attribs *v3.UserAttribute) error { return nil },
+		providerRefresh: func(attribs *v3.UserAttribute) (*v3.UserAttribute, error) {
+			a := attribs.DeepCopy()
+			a.NeedsRefresh = false
+			a.LastRefresh = now.Format(time.RFC3339)
+			return a, nil
+		},
+	}
+
+	obj, err := controller.sync("", attribs)
+	require.NoError(t, err)
+	assert.Nil(t, obj)
+
+	require.NotNil(t, lastUpdated)
+	assert.False(t, lastUpdated.NeedsRefresh)
+	assert.Contains(t, lastUpdated.Annotations, common.ProviderRefreshErrorAnnotation)
+}
+
+func TestSyncSkipsAnnotatedUserAttribute(t *testing.T) {
+	userID := "u-abcdef"
+	attribs := &v3.UserAttribute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: userID,
+			Annotations: map[string]string{
+				common.ProviderRefreshErrorAnnotation: "user not found",
+			},
+		},
+		NeedsRefresh: true,
+	}
+
+	var lastUpdated *v3.UserAttribute
+	providerRefreshCalled := false
+
+	ctrl := gomock.NewController(t)
+
+	userAttributeClient := fake.NewMockNonNamespacedControllerInterface[*v3.UserAttribute, *v3.UserAttributeList](ctrl)
+	userAttributeClient.EXPECT().Get(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(func(name string, opts metav1.GetOptions) (*v3.UserAttribute, error) {
+		return attribs.DeepCopy(), nil
+	})
+	userAttributeClient.EXPECT().Update(gomock.Any()).AnyTimes().DoAndReturn(func(ua *v3.UserAttribute) (*v3.UserAttribute, error) {
+		lastUpdated = ua.DeepCopy()
+		return lastUpdated, nil
+	})
+
+	controller := UserAttributeController{
+		userAttributes:            userAttributeClient,
+		ensureUserRetentionLabels: func(attribs *v3.UserAttribute) error { return nil },
+		providerRefresh: func(attribs *v3.UserAttribute) (*v3.UserAttribute, error) {
+			providerRefreshCalled = true
+			return attribs, nil
+		},
+	}
+
+	obj, err := controller.sync("", attribs)
+	require.NoError(t, err)
+
+	assert.False(t, providerRefreshCalled, "provider refresh should not be called for annotated user")
+
+	synced, ok := obj.(*v3.UserAttribute)
+	require.True(t, ok)
+	assert.False(t, synced.NeedsRefresh)
+	// Annotation is preserved (only cleared on login).
+	assert.Contains(t, synced.Annotations, common.ProviderRefreshErrorAnnotation)
 }

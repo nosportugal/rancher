@@ -39,8 +39,8 @@ import (
 	corecontrollers "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/v3/pkg/schemas/validation"
 	"github.com/sirupsen/logrus"
-	"helm.sh/helm/v3/pkg/registry"
-	"helm.sh/helm/v3/pkg/repo"
+	"helm.sh/helm/v4/pkg/registry"
+	repo "helm.sh/helm/v4/pkg/repo/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
@@ -458,7 +458,7 @@ func skipIndexFiltering() bool {
 	serverVersion := settings.ServerVersion.Get()
 
 	// If the server version is a release or a release candidate (rc), we don't skip filtering.
-	if settings.IsRelease() || strings.Contains(serverVersion, "-rc") {
+	if settings.IsRelease() || strings.Contains(serverVersion, "-rc") || strings.Contains(serverVersion, "-alpha") {
 		return false
 	}
 	// If setting is true, we skip filtering.

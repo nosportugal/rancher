@@ -33,13 +33,14 @@ func Configure(ctx context.Context, mgmtCtx *config.ScaledContext, userMGR user.
 	p := &CognitoProvider{
 		GenOIDCProvider: genericoidc.GenOIDCProvider{
 			OpenIDCProvider: baseoidc.OpenIDCProvider{
-				Name:        Name,
-				Type:        client.CognitoConfigType,
-				CTX:         ctx,
-				AuthConfigs: mgmtCtx.Management.AuthConfigs(""),
-				Secrets:     mgmtCtx.Wrangler.Core.Secret(),
-				UserMGR:     userMGR,
-				TokenMgr:    tokenMgr,
+				Name:         Name,
+				Type:         client.CognitoConfigType,
+				CTX:          ctx,
+				AuthConfigs:  mgmtCtx.Management.AuthConfigs(""),
+				Secrets:      mgmtCtx.Wrangler.Core.Secret(),
+				UserMGR:      userMGR,
+				TokenMgr:     tokenMgr,
+				UserSearcher: common.NewUserSearcher(mgmtCtx.Management.Users("").Controller().Lister()),
 			},
 		},
 	}
@@ -52,6 +53,13 @@ func (p *CognitoProvider) GetName() string {
 	return Name
 }
 
+func (p *CognitoProvider) RefetchGroupPrincipals(principalID string, secret string) ([]v3.Principal, error) {
+	return p.OpenIDCProvider.RefetchGroupPrincipals(principalID, secret)
+}
+
+func (p *CognitoProvider) UsesUserSecrets() bool      { return true }
+func (p *CognitoProvider) CanRefreshPrincipals() bool { return true }
+
 func (p *CognitoProvider) Logout(w http.ResponseWriter, r *http.Request, token accessor.TokenAccessor) error {
 	providerName := token.GetAuthProvider()
 	logrus.Debugf("CognitoProvider [logout]: triggered by provider %s", providerName)
@@ -60,7 +68,6 @@ func (p *CognitoProvider) Logout(w http.ResponseWriter, r *http.Request, token a
 		return fmt.Errorf("getting config for OIDC Logout: %w", err)
 	}
 	if oidcConfig.LogoutAllForced {
-		logrus.Debugf("CognitoProvider [logout]: Rancher provider resource `%v` configured for forced SLO, rejecting regular logout", providerName)
 		return fmt.Errorf("CognitoProvider [logout]: Rancher provider resource `%v` configured for forced SLO, rejecting regular logout", providerName)
 	}
 
@@ -76,7 +83,6 @@ func (p *CognitoProvider) LogoutAll(w http.ResponseWriter, r *http.Request, toke
 
 	providerName := token.GetAuthProvider()
 	if !oidcConfig.LogoutAllEnabled {
-		logrus.Debugf("CognitoProvider [logout-all]: Rancher provider resource `%v` not configured for SLO", providerName)
 		return fmt.Errorf("CognitoProvider [logout-all]: Rancher provider resource `%v` not configured for SLO", providerName)
 	}
 

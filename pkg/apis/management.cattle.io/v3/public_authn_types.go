@@ -231,6 +231,10 @@ type OKTAProvider struct {
 	SamlProvider `json:",inline"`
 }
 
+type GenericSAMLProvider struct {
+	SamlProvider `json:",inline"`
+}
+
 type SamlLoginInput struct {
 	GenericLogin     `json:",inline"`
 	FinalRedirectURL string `json:"finalRedirectUrl"`
@@ -261,8 +265,16 @@ type OIDCLogin struct {
 	Code         string `json:"code" norman:"type=string,required"`
 }
 
+// +genclient
+// +kubebuilder:skipversion
+// +genclient:nonNamespaced
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
 type KeyCloakOIDCProvider struct {
 	OIDCProvider `json:",inline"`
+
+	RedirectURL string `json:"redirectUrl"`
+	Scopes      string `json:"scopes"`
 }
 
 // +genclient

@@ -15,12 +15,13 @@ import (
 	"time"
 
 	goidc "github.com/coreos/go-oidc/v3/oidc"
-	gmux "github.com/gorilla/mux"
 	apimgmtv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/auth/providers"
+	providercommon "github.com/rancher/rancher/pkg/auth/providers/common"
 	providermocks "github.com/rancher/rancher/pkg/auth/providers/mocks"
 	"github.com/rancher/rancher/pkg/auth/tokens"
 	"github.com/rancher/rancher/pkg/controllers/management/oidcprovider"
+	exttokenstore "github.com/rancher/rancher/pkg/ext/stores/tokens"
 	oprovider "github.com/rancher/rancher/pkg/oidc/provider"
 	"github.com/rancher/rancher/pkg/settings"
 	"github.com/rancher/rancher/pkg/wrangler"
@@ -172,10 +173,11 @@ func (s *OIDCProviderSuite) SetupSuite() {
 	})
 	assert.NoError(s.T(), err)
 
+	ets := exttokenstore.NewSystemFromWrangler(s.wranglerContext)
+
 	// init OIDC provider
-	mux := gmux.NewRouter()
-	mux.UseEncodedPath()
-	p, err := oprovider.NewProvider(s.ctx, s.wranglerContext.Mgmt.Token().Cache(), s.wranglerContext.Mgmt.Token(), s.wranglerContext.Mgmt.User().Cache(), s.wranglerContext.Mgmt.UserAttribute().Cache(), s.wranglerContext.Core.Secret().Cache(), s.wranglerContext.Core.Secret(), s.wranglerContext.Mgmt.OIDCClient().Cache(), s.wranglerContext.Mgmt.OIDCClient(), s.wranglerContext.Core.Namespace())
+	mux := http.NewServeMux()
+	p, err := oprovider.NewProvider(s.ctx, ets, s.wranglerContext.Mgmt.Token().Cache(), s.wranglerContext.Mgmt.Token(), s.wranglerContext.Mgmt.User().Cache(), s.wranglerContext.Mgmt.UserAttribute().Cache(), s.wranglerContext.Core.Secret().Cache(), s.wranglerContext.Core.Secret(), s.wranglerContext.Mgmt.OIDCClient().Cache(), s.wranglerContext.Mgmt.OIDCClient(), s.wranglerContext.Core.Namespace())
 	assert.NoError(s.T(), err)
 	p.RegisterOIDCProviderHandles(mux)
 	// register redirect endpoint. This endpoint will be called by the OIDC provider with a valid code.
@@ -212,7 +214,7 @@ func (s *OIDCProviderSuite) TestOIDCAuthorizationCodeFlow() {
 	// mock auth provider
 	mockProvider := providermocks.NewMockAuthProvider(ctrl)
 	mockProvider.EXPECT().IsDisabledProvider().Return(false, nil).AnyTimes()
-	providers.Providers[fakeAuthProvider] = mockProvider
+	providers.SetProviders(map[string]providercommon.AuthProvider{fakeAuthProvider: mockProvider})
 
 	// create OIDC client
 	oidcClient := &apimgmtv3.OIDCClient{

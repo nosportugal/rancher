@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/rancher/rancher/pkg/auth/providers/local"
 	"github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/assert"
@@ -17,6 +16,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 )
+
+func enabledProvider(string) providerConfig { return providerConfig{Enabled: true} }
 
 func TestTokenAuthenticator(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -53,11 +54,12 @@ func TestTokenAuthenticator(t *testing.T) {
 			secretCache:        secretCache,
 			isDisabledProvider: isDisabledProvider,
 			expireTokensAfter:  func() time.Duration { return 0 },
+			getConfig:          enabledProvider,
 		}
 
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 		r.Header.Set("Authorization", "Bearer "+validToken1)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
@@ -110,11 +112,12 @@ func TestTokenAuthenticator(t *testing.T) {
 			secretCache:        secretCache,
 			isDisabledProvider: isDisabledProvider,
 			expireTokensAfter:  func() time.Duration { return time.Hour },
+			getConfig:          enabledProvider,
 		}
 
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 		r.Header.Set("Authorization", "Bearer "+validToken2)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
@@ -127,7 +130,7 @@ func TestTokenAuthenticator(t *testing.T) {
 
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
 
@@ -139,7 +142,7 @@ func TestTokenAuthenticator(t *testing.T) {
 
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 		r.Header.Set("Authorization", validToken1)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
@@ -156,7 +159,7 @@ func TestTokenAuthenticator(t *testing.T) {
 
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 		r.Header.Set("Authorization", "Bearer "+validToken1)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
@@ -170,7 +173,7 @@ func TestTokenAuthenticator(t *testing.T) {
 		provider := "local"
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 		r.Header.Set("Authorization", "Bearer "+validToken1)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
@@ -187,7 +190,7 @@ func TestTokenAuthenticator(t *testing.T) {
 
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 		r.Header.Set("Authorization", "Bearer "+validToken1)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
@@ -203,11 +206,12 @@ func TestTokenAuthenticator(t *testing.T) {
 			secretCache:        secretCache,
 			isDisabledProvider: isDisabledProvider,
 			expireTokensAfter:  func() time.Duration { return 0 },
+			getConfig:          enabledProvider,
 		}
 
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 		r.Header.Set("Authorization", "Bearer "+validToken1)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
@@ -239,13 +243,14 @@ func TestTokenAuthenticator(t *testing.T) {
 			secretCache:        secretCache,
 			isDisabledProvider: isDisabledProvider,
 			expireTokensAfter:  func() time.Duration { return 0 },
+			getConfig:          enabledProvider,
 		}
 
 		someOtherToken := "c4faf0453d39dffa3bf7d3135f6a15e50dbd4b71fe74c5d5b9d45772e36511e1"
 
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 		r.Header.Set("Authorization", "Bearer "+someOtherToken)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
@@ -280,11 +285,12 @@ func TestTokenAuthenticator(t *testing.T) {
 			secrets:            secrets,
 			isDisabledProvider: isDisabledProvider,
 			expireTokensAfter:  func() time.Duration { return time.Hour },
+			getConfig:          enabledProvider,
 		}
 
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 		r.Header.Set("Authorization", "Bearer "+validToken1)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
@@ -330,11 +336,12 @@ func TestTokenAuthenticator(t *testing.T) {
 			secrets:            secrets,
 			isDisabledProvider: isDisabledProvider,
 			expireTokensAfter:  func() time.Duration { return time.Hour },
+			getConfig:          enabledProvider,
 		}
 
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 		r.Header.Set("Authorization", "Bearer "+validToken1)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
@@ -380,16 +387,52 @@ func TestTokenAuthenticator(t *testing.T) {
 			secrets:            secrets,
 			isDisabledProvider: isDisabledProvider,
 			expireTokensAfter:  func() time.Duration { return time.Hour },
+			getConfig:          enabledProvider,
 		}
 
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
-		r = mux.SetURLVars(r, map[string]string{"provider": provider})
+		r.SetPathValue("provider", provider)
 		r.Header.Set("Authorization", "Bearer "+validToken1)
 
 		auth.Authenticate(next).ServeHTTP(w, r)
 
 		// Authentication should succeed despite deletion failure
 		require.Equal(t, http.StatusOK, w.Result().StatusCode)
+	})
+
+	t.Run("scim not enabled", func(t *testing.T) {
+		auth := &tokenAuthenticator{
+			isDisabledProvider: isDisabledProvider,
+			getConfig:          func(string) providerConfig { return providerConfig{Enabled: false} },
+		}
+
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
+		r.SetPathValue("provider", provider)
+		r.Header.Set("Authorization", "Bearer "+validToken1)
+
+		auth.Authenticate(next).ServeHTTP(w, r)
+
+		require.Equal(t, http.StatusNotFound, w.Result().StatusCode)
+	})
+
+	t.Run("scim paused", func(t *testing.T) {
+		secretCache := fake.NewMockCacheInterface[*v1.Secret](ctrl)
+
+		auth := &tokenAuthenticator{
+			secretCache:        secretCache,
+			isDisabledProvider: isDisabledProvider,
+			getConfig:          func(string) providerConfig { return providerConfig{Enabled: true, Paused: true} },
+		}
+
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/v1/scim/"+provider+"/Users", nil)
+		r.SetPathValue("provider", provider)
+		r.Header.Set("Authorization", "Bearer "+validToken1)
+
+		auth.Authenticate(next).ServeHTTP(w, r)
+
+		require.Equal(t, http.StatusServiceUnavailable, w.Result().StatusCode)
 	})
 }

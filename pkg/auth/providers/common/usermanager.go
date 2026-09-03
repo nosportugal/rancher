@@ -15,6 +15,7 @@ import (
 	"github.com/rancher/norman/types/slice"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/auth/accessor"
+	"github.com/rancher/rancher/pkg/controllers"
 	wrangmgmtv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/user"
 	"github.com/rancher/rancher/pkg/wrangler"
@@ -62,7 +63,7 @@ func NewUserManagerNoBindings(wranglerContext *wrangler.Context) (user.Manager, 
 	}, nil
 }
 
-// NewUserManagerNoBindings creates an instance of userManager.
+// NewUserManager creates an instance of userManager.
 func NewUserManager(wranglerContext *wrangler.Context) (user.Manager, error) {
 	userInformer := wranglerContext.Mgmt.User().Informer()
 	// registering the same index more than once will cause an error. Since we attempt to register this index in multiple
@@ -172,7 +173,11 @@ func (m *userManager) SetPrincipalOnCurrentUserByUserID(userID string, principal
 	if !slice.ContainsString(user.PrincipalIDs, principal.Name) {
 		user.PrincipalIDs = append(user.PrincipalIDs, principal.Name)
 		logrus.Infof("Updating user %v. Adding principal", user.Name)
-		return m.users.Update(user)
+		impClient, err := m.users.WithImpersonation(controllers.WebhookImpersonation())
+		if err != nil {
+			return nil, fmt.Errorf("impersonating webhook to update principal: %w", err)
+		}
+		return impClient.Update(user)
 	}
 	return user, nil
 }
@@ -377,7 +382,16 @@ func (m *userManager) UserAttributeCreateOrUpdate(userID, provider string, group
 		userExtraInfo = make(map[string][]string)
 	}
 
-	shouldUpdate := m.userAttributeChanged(attribs, provider, userExtraInfo, groupPrincipals)
+	var shouldUpdate bool
+
+	if _, ok := attribs.Annotations[ProviderRefreshErrorAnnotation]; ok {
+		delete(attribs.Annotations, ProviderRefreshErrorAnnotation)
+		shouldUpdate = true
+	}
+
+	if m.userAttributeChanged(attribs, provider, userExtraInfo, groupPrincipals) {
+		shouldUpdate = true
+	}
 	if len(loginTime) > 0 && !loginTime[0].IsZero() {
 		// Login time is truncated to seconds as the corresponding user label is set as epoch time.
 		lastLogin := metav1.NewTime(loginTime[0].Truncate(time.Second))

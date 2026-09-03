@@ -2,17 +2,18 @@ package scim
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 	"strings"
 
-	"github.com/gorilla/mux"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/utils/ptr"
 )
 
 // Bool represents a boolean value that can be unmarshaled from JSON strings or boolean literals.
@@ -82,7 +83,7 @@ type scimUser struct {
 func (s *SCIMServer) ListUsers(w http.ResponseWriter, r *http.Request) {
 	logrus.Tracef("scim::ListUsers: url %s", r.URL)
 
-	provider := mux.Vars(r)["provider"]
+	provider := r.PathValue("provider")
 
 	// Parse pagination parameters.
 	pagination, err := parsePaginationParams(r)
@@ -99,8 +100,7 @@ func (s *SCIMServer) ListUsers(w http.ResponseWriter, r *http.Request) {
 			writeError(w, NewError(http.StatusBadRequest, err.Error()))
 			return
 		}
-		// Currently only support userName eq "<value>" filter.
-		if err := filter.ValidateForAttribute("userName", opEqual); err != nil {
+		if err := filter.ValidateForAttributes([]string{"userName", "externalId"}, opEqual); err != nil {
 			writeError(w, NewError(http.StatusBadRequest, err.Error()))
 			return
 		}
@@ -151,7 +151,13 @@ func (s *SCIMServer) ListUsers(w http.ResponseWriter, r *http.Request) {
 		externalID := first(attr.ExtraByProvider[provider]["externalid"])
 
 		// Apply filter.
-		if !filter.Matches(userName) {
+		var filterTarget string
+		if filter != nil && strings.EqualFold(filter.Attribute, "externalId") {
+			filterTarget = externalID
+		} else {
+			filterTarget = userName
+		}
+		if !filter.Matches(filterTarget) {
 			continue
 		}
 
@@ -202,6 +208,7 @@ func (s *SCIMServer) ListUsers(w http.ResponseWriter, r *http.Request) {
 
 // CreateUser creates a new user.
 // Returns:
+//   - 200 when re-provisioning a previously deactivated user (matched by externalId)
 //   - 201 on success
 //   - 400 for invalid requests
 //   - 409 if the user already exists.
@@ -214,7 +221,7 @@ func (s *SCIMServer) ListUsers(w http.ResponseWriter, r *http.Request) {
 func (s *SCIMServer) CreateUser(w http.ResponseWriter, r *http.Request) {
 	logrus.Tracef("scim::CreateUser: url %s", r.URL)
 
-	provider := mux.Vars(r)["provider"]
+	provider := r.PathValue("provider")
 
 	payload := scimUser{}
 	err := json.NewDecoder(r.Body).Decode(&payload)
@@ -229,12 +236,26 @@ func (s *SCIMServer) CreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cfg := s.getConfig(provider)
+	uid := cfg.userID(payload)
+	if uid == "" {
+		writeError(w, NewError(http.StatusBadRequest,
+			fmt.Sprintf("%s is required when configured as userIdAttribute", cfg.UserIDAttribute)))
+		return
+	}
+
 	list, err := s.userCache.List(labels.Everything())
 	if err != nil {
 		logrus.Errorf("scim::CreateUser: failed to list users: %s", err)
 		writeError(w, NewInternalError())
 		return
 	}
+
+	type reprovisionMatch struct {
+		user *v3.User
+		attr *v3.UserAttribute
+	}
+	var reprovisionCandidate *reprovisionMatch
 
 	for _, user := range list {
 		attr, err := s.userAttributeCache.Get(user.Name)
@@ -250,13 +271,39 @@ func (s *SCIMServer) CreateUser(w http.ResponseWriter, r *http.Request) {
 
 		userName := first(attr.ExtraByProvider[provider]["username"])
 		if strings.EqualFold(userName, payload.UserName) {
-			writeError(w, NewError(http.StatusConflict, fmt.Sprintf("User with username %s already exists", payload.UserName)))
-			return
+			// Allow fall-through for a disabled user whose externalId matches the payload.
+			// This handles retries after a partial failure in reprovisionUser where
+			// userAttributes was updated (new username) but the user wasn't re-enabled.
+			if user.GetEnabled() || payload.ExternalID == "" ||
+				!strings.EqualFold(first(attr.ExtraByProvider[provider]["externalid"]), payload.ExternalID) {
+				writeError(w, NewError(http.StatusConflict, fmt.Sprintf("User with username %s already exists", payload.UserName)))
+				return
+			}
+		}
+
+		if payload.ExternalID != "" {
+			eid := first(attr.ExtraByProvider[provider]["externalid"])
+			if strings.EqualFold(eid, payload.ExternalID) {
+				if user.GetEnabled() {
+					writeError(w, NewError(http.StatusConflict, fmt.Sprintf("Active user with externalId %s already exists", payload.ExternalID)))
+					return
+				}
+				reprovisionCandidate = &reprovisionMatch{user: user, attr: attr}
+			}
 		}
 	}
 
-	principalName := provider + "_user://" + payload.UserName
-	user, err := s.userMGR.EnsureUser(principalName, payload.UserName)
+	if reprovisionCandidate != nil && cfg.UserIDAttribute == UserIDExternalID {
+		s.reprovisionUser(w, r, provider, payload, reprovisionCandidate.user, reprovisionCandidate.attr)
+		return
+	}
+
+	principalName := userPrincipalName(provider, uid)
+	displayName := payload.DisplayName
+	if displayName == "" {
+		displayName = payload.UserName
+	}
+	user, err := s.userMGR.EnsureUser(principalName, displayName)
 	if err != nil {
 		logrus.Errorf("scim::CreateUser: failed to ensure user %s: %s", principalName, err)
 		writeError(w, NewInternalError())
@@ -312,6 +359,74 @@ func (s *SCIMServer) CreateUser(w http.ResponseWriter, r *http.Request) {
 	writeResponse(w, response, http.StatusCreated)
 }
 
+// reprovisionUser re-enables a previously deactivated user whose externalId
+// matches the incoming CreateUser payload. Some IdPs deactivate and re-provision
+// a user instead of updating in-place when the userName changes.
+// The principal is not modified — this only applies when the principal is based on
+// externalId (stable), not userName.
+func (s *SCIMServer) reprovisionUser(w http.ResponseWriter, r *http.Request, provider string, payload scimUser, user *v3.User, attr *v3.UserAttribute) {
+	attr = attr.DeepCopy()
+	attr.ExtraByProvider[provider]["username"] = []string{payload.UserName}
+
+	var primaryEmail string
+	for _, email := range payload.Emails {
+		if email.Primary {
+			primaryEmail = email.Value
+			break
+		}
+	}
+	if primaryEmail != "" {
+		attr.ExtraByProvider[provider]["email"] = []string{primaryEmail}
+	}
+
+	if _, err := s.userAttributes.Update(attr); err != nil {
+		logrus.Errorf("scim::reprovisionUser: failed to update user attributes for %s: %s", user.Name, err)
+		writeError(w, NewInternalError())
+		return
+	}
+
+	user = user.DeepCopy()
+	user.Enabled = ptr.To(true)
+	displayName := payload.DisplayName
+	if displayName == "" {
+		displayName = payload.UserName
+	}
+	if user.DisplayName != displayName {
+		user.DisplayName = displayName
+	}
+
+	if _, err := s.users.Update(user); err != nil {
+		logrus.Errorf("scim::reprovisionUser: failed to update user %s: %s", user.Name, err)
+		writeError(w, NewInternalError())
+		return
+	}
+
+	location := locationURL(r, provider, userEndpoint, user.Name)
+	response := map[string]any{
+		"schemas":    []string{userSchemaID},
+		"id":         user.Name,
+		"userName":   payload.UserName,
+		"externalId": first(attr.ExtraByProvider[provider]["externalid"]),
+		"active":     true,
+		"meta": map[string]any{
+			"resourceType": userResource,
+			"created":      user.CreationTimestamp,
+			"location":     location,
+		},
+	}
+	if primaryEmail != "" {
+		response["emails"] = []map[string]any{
+			{
+				"value":   primaryEmail,
+				"primary": true,
+			},
+		}
+	}
+
+	w.Header().Set("Location", location)
+	writeResponse(w, response, http.StatusOK)
+}
+
 // GetUser retrieves a user by their ID.
 // Returns:
 //   - 200 on success
@@ -320,8 +435,8 @@ func (s *SCIMServer) CreateUser(w http.ResponseWriter, r *http.Request) {
 func (s *SCIMServer) GetUser(w http.ResponseWriter, r *http.Request) {
 	logrus.Tracef("scim::GetUser: query %s", r.URL)
 
-	provider := mux.Vars(r)["provider"]
-	id := mux.Vars(r)["id"]
+	provider := r.PathValue("provider")
+	id := r.PathValue("id")
 
 	user, err := s.userCache.Get(id)
 	if err != nil {
@@ -340,9 +455,9 @@ func (s *SCIMServer) GetUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	attr, err := s.userAttributeCache.Get(user.Name)
+	attr, _, err := s.userMGR.EnsureAndGetUserAttribute(user.Name)
 	if err != nil {
-		logrus.Errorf("scim::GetUsers: failed to get user attributes for %s: %s", user.Name, err)
+		logrus.Errorf("scim::GetUser: failed to get user attributes for %s: %s", user.Name, err)
 		writeError(w, NewInternalError())
 		return
 	}
@@ -373,6 +488,43 @@ func (s *SCIMServer) GetUser(w http.ResponseWriter, r *http.Request) {
 	writeResponse(w, response)
 }
 
+func (s *SCIMServer) checkUserConflict(provider, userName, externalID, excludeUser string) *Error {
+	if userName == "" && externalID == "" {
+		return nil
+	}
+
+	users, err := s.userCache.List(labels.Everything())
+	if err != nil {
+		logrus.Errorf("scim::checkUserConflict: failed to list users: %s", err)
+		return NewInternalError()
+	}
+
+	for _, u := range users {
+		if u.Name == excludeUser {
+			continue
+		}
+
+		attr, err := s.userAttributeCache.Get(u.Name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			logrus.Errorf("scim::checkUserConflict: failed to get user attributes for %s: %s", u.Name, err)
+			return NewInternalError()
+		}
+
+		if userName != "" && strings.EqualFold(first(attr.ExtraByProvider[provider]["username"]), userName) {
+			return NewError(http.StatusConflict, fmt.Sprintf("User with username %s already exists", userName))
+		}
+
+		if externalID != "" && strings.EqualFold(first(attr.ExtraByProvider[provider]["externalid"]), externalID) {
+			return NewError(http.StatusConflict, fmt.Sprintf("User with externalId %s already exists", externalID))
+		}
+	}
+
+	return nil
+}
+
 // UpdateUser updates an existing user.
 // Returns:
 //   - 200 on success
@@ -382,8 +534,8 @@ func (s *SCIMServer) GetUser(w http.ResponseWriter, r *http.Request) {
 func (s *SCIMServer) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	logrus.Tracef("scim::UpdateUser: url %s", r.URL)
 
-	provider := mux.Vars(r)["provider"]
-	id := mux.Vars(r)["id"]
+	provider := r.PathValue("provider")
+	id := r.PathValue("id")
 
 	payload := scimUser{}
 	err := json.NewDecoder(r.Body).Decode(&payload)
@@ -410,9 +562,9 @@ func (s *SCIMServer) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	attr, err := s.userAttributeCache.Get(user.Name)
+	attr, attrNeedsCreate, err := s.userMGR.EnsureAndGetUserAttribute(user.Name)
 	if err != nil {
-		logrus.Errorf("scim::UpdateUsers: failed to get user attributes for %s: %s", user.Name, err)
+		logrus.Errorf("scim::UpdateUser: failed to get user attributes for %s: %s", user.Name, err)
 		writeError(w, NewInternalError())
 		return
 	}
@@ -422,18 +574,38 @@ func (s *SCIMServer) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cfg := s.getConfig(provider)
+
 	var shouldUpdateAttr, shouldUpdateUser bool
 	attr = attr.DeepCopy()
 	if attr.ExtraByProvider[provider] == nil {
 		attr.ExtraByProvider[provider] = map[string][]string{}
 	}
+
+	var changedUserName, changedExternalID string
+
 	if userName := first(attr.ExtraByProvider[provider]["username"]); userName != payload.UserName {
+		if cfg.UserIDAttribute != UserIDExternalID {
+			writeError(w, NewError(http.StatusBadRequest, "userName cannot be changed when it is used as the principal identifier", "mutability"))
+			return
+		}
+		changedUserName = payload.UserName
 		attr.ExtraByProvider[provider]["username"] = []string{payload.UserName}
 		shouldUpdateAttr = true
 	}
-	if externalId := first(attr.ExtraByProvider[provider]["externalid"]); externalId != payload.ExternalID {
+	if externalID := first(attr.ExtraByProvider[provider]["externalid"]); externalID != payload.ExternalID {
+		if cfg.UserIDAttribute == UserIDExternalID {
+			writeError(w, NewError(http.StatusBadRequest, "externalId cannot be changed when it is used as the principal identifier", "mutability"))
+			return
+		}
+		changedExternalID = payload.ExternalID
 		attr.ExtraByProvider[provider]["externalid"] = []string{payload.ExternalID}
 		shouldUpdateAttr = true
+	}
+
+	if scimErr := s.checkUserConflict(provider, changedUserName, changedExternalID, user.Name); scimErr != nil {
+		writeError(w, scimErr)
+		return
 	}
 
 	payloadActive := payload.Active.Bool()
@@ -448,8 +620,13 @@ func (s *SCIMServer) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		shouldUpdateUser = true
 	}
 	if shouldUpdateAttr {
-		if attr, err = s.userAttributes.Update(attr); err != nil {
-			logrus.Errorf("scim::UpdateUser: failed to update user attributes for %s: %s", user.Name, err)
+		if attrNeedsCreate {
+			attr, err = s.userAttributes.Create(attr)
+		} else {
+			attr, err = s.userAttributes.Update(attr)
+		}
+		if err != nil {
+			logrus.Errorf("scim::UpdateUser: failed to save user attributes for %s: %s", user.Name, err)
 			writeError(w, NewInternalError())
 			return
 		}
@@ -497,8 +674,8 @@ func (s *SCIMServer) UpdateUser(w http.ResponseWriter, r *http.Request) {
 //   - 409 if attempting to delete the default admin user.
 func (s *SCIMServer) DeleteUser(w http.ResponseWriter, r *http.Request) {
 	logrus.Tracef("scim::DeleteUser: url %s", r.URL)
-	// provider := mux.Vars(r)["provider"]
-	id := mux.Vars(r)["id"]
+	// provider := r.PathValue("provider")
+	id := r.PathValue("id")
 
 	user, err := s.userCache.Get(id)
 	if err != nil {
@@ -542,8 +719,8 @@ func (s *SCIMServer) DeleteUser(w http.ResponseWriter, r *http.Request) {
 func (s *SCIMServer) PatchUser(w http.ResponseWriter, r *http.Request) {
 	logrus.Tracef("scim::PatchUser: url %s", r.URL)
 
-	provider := mux.Vars(r)["provider"]
-	id := mux.Vars(r)["id"]
+	provider := r.PathValue("provider")
+	id := r.PathValue("id")
 
 	user, err := s.userCache.Get(id)
 	if err != nil {
@@ -573,7 +750,7 @@ func (s *SCIMServer) PatchUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	attr, err := s.userAttributeCache.Get(user.Name)
+	attr, attrNeedsCreate, err := s.userMGR.EnsureAndGetUserAttribute(user.Name)
 	if err != nil {
 		logrus.Errorf("scim::PatchUser: failed to get user attributes for %s: %s", user.Name, err)
 		writeError(w, NewInternalError())
@@ -583,14 +760,24 @@ func (s *SCIMServer) PatchUser(w http.ResponseWriter, r *http.Request) {
 	attr = attr.DeepCopy()
 	user = user.DeepCopy()
 
+	cfg := s.getConfig(provider)
+
+	origUserName := first(attr.ExtraByProvider[provider]["username"])
+	origExternalID := first(attr.ExtraByProvider[provider]["externalid"])
+
 	var shouldUpdateAttr, shouldUpdateUser bool
 	for _, op := range payload.Operations {
 		switch strings.ToLower(op.Op) {
-		case "replace":
-			updateAttr, updateUser, err := applyReplaceUser(provider, attr, user, op)
+		case "replace", "add":
+			updateAttr, updateUser, err := applyPatchUser(provider, attr, user, op, cfg)
 			if err != nil {
-				logrus.Errorf("scim::PatchUser: failed to apply replace operation: %s", err)
-				writeError(w, NewError(http.StatusBadRequest, fmt.Sprintf("Failed to apply replace operation: %s", err)))
+				logrus.Errorf("scim::PatchUser: failed to apply %s operation: %s", op.Op, err)
+				var scimErr *Error
+				if errors.As(err, &scimErr) {
+					writeError(w, scimErr)
+				} else {
+					writeError(w, NewError(http.StatusBadRequest, fmt.Sprintf("Failed to apply %s operation: %s", op.Op, err)))
+				}
 				return
 			}
 			if updateAttr {
@@ -605,9 +792,26 @@ func (s *SCIMServer) PatchUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var changedUserName, changedExternalID string
+	if newUserName := first(attr.ExtraByProvider[provider]["username"]); newUserName != origUserName {
+		changedUserName = newUserName
+	}
+	if newExternalID := first(attr.ExtraByProvider[provider]["externalid"]); newExternalID != origExternalID {
+		changedExternalID = newExternalID
+	}
+	if scimErr := s.checkUserConflict(provider, changedUserName, changedExternalID, user.Name); scimErr != nil {
+		writeError(w, scimErr)
+		return
+	}
+
 	if shouldUpdateAttr {
-		if attr, err = s.userAttributes.Update(attr); err != nil {
-			logrus.Errorf("scim::PatchUser: failed to update user attributes for %s: %s", user.Name, err)
+		if attrNeedsCreate {
+			attr, err = s.userAttributes.Create(attr)
+		} else {
+			attr, err = s.userAttributes.Update(attr)
+		}
+		if err != nil {
+			logrus.Errorf("scim::PatchUser: failed to save user attributes for %s: %s", user.Name, err)
 			writeError(w, NewInternalError())
 			return
 		}
@@ -648,8 +852,9 @@ func (s *SCIMServer) PatchUser(w http.ResponseWriter, r *http.Request) {
 	writeResponse(w, response)
 }
 
-// applyReplaceUser applies a SCIM PATCH replace operation to a user.
-func applyReplaceUser(provider string, attr *v3.UserAttribute, user *v3.User, op patchOp) (bool, bool, error) {
+// applyPatchUser applies a SCIM PATCH add/replace operation to a user.
+// For single-valued attributes, add and replace have identical semantics (RFC 7644 §3.5.2).
+func applyPatchUser(provider string, attr *v3.UserAttribute, user *v3.User, op patchOp, cfg providerConfig) (bool, bool, error) {
 	if op.Path == "" {
 		fields, ok := op.Value.(map[string]any)
 		if !ok {
@@ -658,13 +863,16 @@ func applyReplaceUser(provider string, attr *v3.UserAttribute, user *v3.User, op
 
 		var shouldUpdateAttr, shouldUpdateUser bool
 		for name, value := range fields {
-			updateAttr, updateUser, err := applyReplaceUser(provider, attr, user, patchOp{
+			if name == "" {
+				return false, false, NewError(http.StatusBadRequest, "empty attribute name in bulk operation")
+			}
+			updateAttr, updateUser, err := applyPatchUser(provider, attr, user, patchOp{
 				Op:    "replace",
 				Path:  name,
 				Value: value,
-			})
+			}, cfg)
 			if err != nil {
-				return false, false, fmt.Errorf("failed to apply replace operation: %v", err)
+				return false, false, fmt.Errorf("failed to apply %s operation: %w", op.Op, err)
 			}
 			if updateAttr {
 				shouldUpdateAttr = true
@@ -676,8 +884,13 @@ func applyReplaceUser(provider string, attr *v3.UserAttribute, user *v3.User, op
 		return shouldUpdateAttr, shouldUpdateUser, nil
 	}
 
+	path, _, err := stripSchemaURN(op.Path, userResource)
+	if err != nil {
+		return false, false, NewError(http.StatusBadRequest, fmt.Sprintf("Invalid path %q: %s", op.Path, err))
+	}
+
 	var updateAttr, updateUser bool
-	switch strings.ToLower(op.Path) {
+	switch strings.ToLower(path) {
 	case "active":
 		active, err := boolFromValue(op.Value)
 		if err != nil {
@@ -692,6 +905,29 @@ func applyReplaceUser(provider string, attr *v3.UserAttribute, user *v3.User, op
 			user.Enabled = &active
 			updateUser = true
 		}
+	case "displayname":
+		displayName, ok := op.Value.(string)
+		if !ok {
+			return false, false, NewError(http.StatusBadRequest, fmt.Sprintf("Invalid value for displayName: %v", op.Value))
+		}
+
+		if user.DisplayName != displayName {
+			user.DisplayName = displayName
+			updateUser = true
+		}
+	case "username":
+		username, ok := op.Value.(string)
+		if !ok {
+			return false, false, NewError(http.StatusBadRequest, fmt.Sprintf("Invalid value for userName: %v", op.Value))
+		}
+
+		if first(attr.ExtraByProvider[provider]["username"]) != username {
+			if cfg.UserIDAttribute != UserIDExternalID {
+				return false, false, NewError(http.StatusBadRequest, "userName cannot be changed when it is used as the principal identifier", "mutability")
+			}
+			attr.ExtraByProvider[provider]["username"] = []string{username}
+			updateAttr = true
+		}
 	case "externalid":
 		externalID, ok := op.Value.(string)
 		if !ok {
@@ -699,6 +935,9 @@ func applyReplaceUser(provider string, attr *v3.UserAttribute, user *v3.User, op
 		}
 
 		if first(attr.ExtraByProvider[provider]["externalid"]) != externalID {
+			if cfg.UserIDAttribute == UserIDExternalID {
+				return false, false, NewError(http.StatusBadRequest, "externalId cannot be changed when it is used as the principal identifier", "mutability")
+			}
 			attr.ExtraByProvider[provider]["externalid"] = []string{externalID}
 			updateAttr = true
 		}

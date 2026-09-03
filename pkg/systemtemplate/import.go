@@ -35,27 +35,35 @@ var (
 )
 
 type clusterAgentContext struct {
-	Features              string
-	CAChecksum            string
-	AgentImage            string
-	AgentEnvVars          string
-	AuthImage             string
-	TokenKey              string
-	Token                 string
-	URL                   string
-	Namespace             string
-	URLPlain              string
-	IsPreBootstrap        bool
-	PrivateRegistryConfig string
-	Tolerations           string
-	AppendTolerations     string
-	Affinity              string
-	ResourceRequirements  string
-	ClusterRegistry       string
-	EnablePriorityClass   bool
-	PodDisruptionBudget   string
-	SUCAppNameOverride    string
-	NamespaceOptions      namespace.Mutator
+	Features             string
+	CAChecksum           string
+	AgentImage           string
+	AgentEnvVars         string
+	AuthImage            string
+	AssetsImage          string
+	TokenKey             string
+	Token                string
+	URL                  string
+	Namespace            string
+	URLPlain             string
+	IsPreBootstrap       bool
+	Tolerations          string
+	AppendTolerations    string
+	Affinity             string
+	ResourceRequirements string
+	ClusterRegistry      string
+	EnablePriorityClass  bool
+	PodDisruptionBudget  string
+	SUCAppNameOverride   string
+	NamespaceOptions     namespace.Mutator
+	// AgentDeploymentPullSecrets are pull secrets that are used exclusively for
+	// the cluster agent deployment
+	AgentDeploymentPullSecrets []util.AgentPullSecret
+	// SystemDefaultPullSecrets are secret references passed to the cluster
+	// agent as environment variables, later used to deploy system charts with the
+	// correct pull secret configuration.
+	SystemDefaultPullSecrets []util.AgentPullSecret
+	AllPullSecrets           []util.AgentPullSecret
 }
 
 type priorityClassContext struct {
@@ -135,25 +143,57 @@ func PodDisruptionBudgetTemplate(cluster *apimgmtv3.Cluster) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func SystemTemplate(resp io.Writer, agentImage, authImage, namespace, token, url string, isPreBootstrap bool,
-	cluster *apimgmtv3.Cluster, agentFeatures map[string]bool, taints []corev1.Taint,
-	secretLister v1.SecretLister, pcExists bool, mutator namespace.Mutator) error {
+type TemplateOps struct {
+	AgentImage     string
+	AuthImage      string
+	AssetsImage    string
+	Namespace      string
+	Token          string
+	URL            string
+	IsPreBootstrap bool
+	Cluster        *apimgmtv3.Cluster
+	AgentFeatures  map[string]bool
+	Taints         []corev1.Taint
+	SecretLister   v1.SecretLister
+	PcExists       bool
+	Mutator        namespace.Mutator
+}
+
+func SystemTemplate(resp io.Writer, ops *TemplateOps) error {
 	var tolerations, agentEnvVars, agentAppendTolerations, agentAffinity, agentResourceRequirements string
-	d := sha256.Sum256([]byte(fmt.Sprintf("%s.%s.%s", url, token, namespace)))
+	d := sha256.Sum256([]byte(fmt.Sprintf("%s.%s.%s", ops.URL, ops.Token, ops.Namespace)))
 	tokenKey := hex.EncodeToString(d[:])[:10]
 
-	if authImage == "fixed" {
-		authImage = settings.AuthImage.Get()
+	if ops.AuthImage == "fixed" {
+		ops.AuthImage = settings.AuthImage.Get()
 	}
 
-	registryURL, registryConfig, err := util.GeneratePrivateRegistryEncodedDockerConfig(cluster, secretLister)
+	if ops.AssetsImage == "fixed" {
+		ops.AssetsImage = settings.AssetsImage.Get()
+	}
+
+	var registryURL string
+	var err error
+	var registryConfigs, agentDeploymentPullSecrets, systemDefaultPullSecrets []util.AgentPullSecret
+
+	registryURL, registryConfigs, err = util.GeneratePrivateRegistryEncodedDockerConfig(ops.Cluster, ops.SecretLister)
 	if err != nil {
 		return err
 	}
 
-	if taints != nil {
-		tolerationList := make([]corev1.Toleration, 0, len(taints))
-		for _, taint := range taints {
+	// ensure the cluster agent can always be pulled, regardless of cluster type.
+	agentDeploymentPullSecrets = registryConfigs
+
+	// only set the _system default_ pull secrets for imported or hosted clusters, which are identified by the legacy cluster naming convention (c-xxxxx).
+	// Provisioned and custom clusters (identified by c-m-xxxxx) will use the underlying containerd configuration set at the node level
+	// to authenticate pulls, so deploying image pull secrets in those environments is unnecessary.
+	if util.MgmtNameRegexp.MatchString(ops.Cluster.Name) {
+		systemDefaultPullSecrets = registryConfigs
+	}
+
+	if ops.Taints != nil {
+		tolerationList := make([]corev1.Toleration, 0, len(ops.Taints))
+		for _, taint := range ops.Taints {
 			toleration := corev1.Toleration{
 				Key:    taint.Key,
 				Effect: taint.Effect,
@@ -172,8 +212,8 @@ func SystemTemplate(resp io.Writer, agentImage, authImage, namespace, token, url
 	}
 
 	envVars := settings.DefaultAgentSettingsAsEnvVars()
-	if cluster != nil {
-		envVars = append(envVars, cluster.Spec.AgentEnvVars...)
+	if ops.Cluster != nil {
+		envVars = append(envVars, ops.Cluster.Spec.AgentEnvVars...)
 	}
 
 	// Merge the env vars with the AgentTLSModeStrict
@@ -199,14 +239,14 @@ func SystemTemplate(resp io.Writer, agentImage, authImage, namespace, token, url
 
 	agentEnvVars = toYAML(envVars)
 
-	if appendTolerations := util.GetClusterAgentTolerations(cluster); appendTolerations != nil {
+	if appendTolerations := util.GetClusterAgentTolerations(ops.Cluster); appendTolerations != nil {
 		agentAppendTolerations = toYAML(appendTolerations)
 		if agentAppendTolerations == "" {
 			return fmt.Errorf("error converting agent append tolerations to YAML")
 		}
 	}
 
-	affinity, err := util.GetClusterAgentAffinity(cluster)
+	affinity, err := util.GetClusterAgentAffinity(ops.Cluster)
 	if err != nil {
 		return err
 	}
@@ -215,18 +255,18 @@ func SystemTemplate(resp io.Writer, agentImage, authImage, namespace, token, url
 		return fmt.Errorf("error converting agent affinity to YAML")
 	}
 
-	if resourceRequirements := util.GetClusterAgentResourceRequirements(cluster); resourceRequirements != nil {
+	if resourceRequirements := util.GetClusterAgentResourceRequirements(ops.Cluster); resourceRequirements != nil {
 		agentResourceRequirements = toYAML(resourceRequirements)
 		if agentResourceRequirements == "" {
 			return fmt.Errorf("error converting agent resource requirements to YAML")
 		}
 	}
 
-	pcEnabled, pdbEnabled := util.AgentSchedulingCustomizationEnabled(cluster)
+	pcEnabled, pdbEnabled := util.AgentSchedulingCustomizationEnabled(ops.Cluster)
 
 	var pdb string
 	if pdbEnabled {
-		pdbYaml, err := PodDisruptionBudgetTemplate(cluster)
+		pdbYaml, err := PodDisruptionBudgetTemplate(ops.Cluster)
 		if err != nil {
 			return err
 		}
@@ -234,37 +274,40 @@ func SystemTemplate(resp io.Writer, agentImage, authImage, namespace, token, url
 	}
 
 	context := &clusterAgentContext{
-		Features:              toFeatureString(agentFeatures),
-		CAChecksum:            CAChecksum(),
-		AgentImage:            agentImage,
-		AgentEnvVars:          agentEnvVars,
-		AuthImage:             authImage,
-		TokenKey:              tokenKey,
-		Token:                 base64.StdEncoding.EncodeToString([]byte(token)),
-		URL:                   base64.StdEncoding.EncodeToString([]byte(url)),
-		Namespace:             base64.StdEncoding.EncodeToString([]byte(namespace)),
-		URLPlain:              url,
-		IsPreBootstrap:        isPreBootstrap,
-		PrivateRegistryConfig: registryConfig,
-		Tolerations:           tolerations,
-		AppendTolerations:     agentAppendTolerations,
-		Affinity:              agentAffinity,
-		ResourceRequirements:  agentResourceRequirements,
-		ClusterRegistry:       registryURL,
-		PodDisruptionBudget:   pdb,
-		EnablePriorityClass:   pcExists && pcEnabled,
+		Features:                   toFeatureString(ops.AgentFeatures),
+		CAChecksum:                 CAChecksum(),
+		AgentImage:                 ops.AgentImage,
+		AgentEnvVars:               agentEnvVars,
+		AuthImage:                  ops.AuthImage,
+		AssetsImage:                ops.AssetsImage,
+		TokenKey:                   tokenKey,
+		Token:                      base64.StdEncoding.EncodeToString([]byte(ops.Token)),
+		URL:                        base64.StdEncoding.EncodeToString([]byte(ops.URL)),
+		Namespace:                  base64.StdEncoding.EncodeToString([]byte(ops.Namespace)),
+		URLPlain:                   ops.URL,
+		IsPreBootstrap:             ops.IsPreBootstrap,
+		Tolerations:                tolerations,
+		AppendTolerations:          agentAppendTolerations,
+		Affinity:                   agentAffinity,
+		ResourceRequirements:       agentResourceRequirements,
+		ClusterRegistry:            registryURL,
+		PodDisruptionBudget:        pdb,
+		EnablePriorityClass:        ops.PcExists && pcEnabled,
+		SystemDefaultPullSecrets:   systemDefaultPullSecrets,
+		AgentDeploymentPullSecrets: agentDeploymentPullSecrets,
+		AllPullSecrets:             registryConfigs,
 		SUCAppNameOverride: func() string {
 			// Set the field to ensure backward compatibility in the case of node-driver RKE2/K3s cluster
-			if cluster.Status.Driver == apimgmtv3.ClusterDriverImported &&
-				(cluster.Status.Provider == apimgmtv3.ClusterDriverRke2 || cluster.Status.Provider == apimgmtv3.ClusterDriverK3s) {
-				if cluster.Spec.DisplayName != "" {
+			if ops.Cluster.Status.Driver == apimgmtv3.ClusterDriverImported &&
+				(ops.Cluster.Status.Provider == apimgmtv3.ClusterDriverRke2 || ops.Cluster.Status.Provider == apimgmtv3.ClusterDriverK3s) {
+				if ops.Cluster.Spec.DisplayName != "" {
 					return capr.SafeConcatName(capr.MaxHelmReleaseNameLength, "mcc",
-						capr.SafeConcatName(48, cluster.Spec.DisplayName, "managed", "system-upgrade-controller"))
+						capr.SafeConcatName(48, ops.Cluster.Spec.DisplayName, "managed", "system-upgrade-controller"))
 				}
 			}
 			return ""
 		}(),
-		NamespaceOptions: mutator,
+		NamespaceOptions: ops.Mutator,
 	}
 
 	return t.Execute(resp, context)
@@ -274,7 +317,16 @@ func GetDesiredFeatures(cluster *apimgmtv3.Cluster) map[string]bool {
 	enableMSUC := false
 	if cluster.Status.Driver == apimgmtv3.ClusterDriverRke2 || cluster.Status.Driver == apimgmtv3.ClusterDriverK3s {
 		// the case of imported RKE2/K3s cluster
-		enableMSUC = importedclusterversionmanagement.Enabled(cluster) && features.ManagedSystemUpgradeController.Enabled()
+		if features.ManagedSystemUpgradeController.Enabled() {
+			if importedclusterversionmanagement.Enabled(cluster) {
+				enableMSUC = true
+			} else if cluster.Labels != nil {
+				if _, ok := cluster.Labels["cluster-api.cattle.io/owned"]; ok {
+					// install for CAPRKE2
+					enableMSUC = true
+				}
+			}
+		}
 	}
 	if cluster.Status.Driver == apimgmtv3.ClusterDriverImported &&
 		(cluster.Status.Provider == apimgmtv3.ClusterDriverRke2 || cluster.Status.Provider == apimgmtv3.ClusterDriverK3s) {
@@ -289,20 +341,31 @@ func GetDesiredFeatures(cluster *apimgmtv3.Cluster) map[string]bool {
 		features.RKE2.Name():                           false,
 		features.ProvisioningV2.Name():                 false,
 		features.Turtles.Name():                        false,
-		features.UISQLCache.Name():                     features.UISQLCache.Enabled(),
 		features.ProvisioningPreBootstrap.Name():       capr.PreBootstrap(cluster),
 		features.ManagedSystemUpgradeController.Name(): enableMSUC,
 	}
 }
 
 func ForCluster(cluster *apimgmtv3.Cluster, token string, taints []corev1.Taint, secretLister v1.SecretLister) ([]byte, error) {
-
 	status := util.GetAgentSchedulingCustomizationStatus(cluster)
 	pcExists := status != nil && status.PriorityClass != nil
 
 	buf := &bytes.Buffer{}
-	err := SystemTemplate(buf, GetDesiredAgentImage(cluster), GetDesiredAuthImage(cluster),
-		cluster.Name, token, settings.ServerURL.Get(), capr.PreBootstrap(cluster), cluster, GetDesiredFeatures(cluster), taints, secretLister, pcExists, namespace.GetMutator())
+	err := SystemTemplate(buf, &TemplateOps{
+		AgentImage:     GetDesiredAgentImage(cluster),
+		AuthImage:      GetDesiredAuthImage(cluster),
+		AssetsImage:    GetDesiredAssetsImage(cluster),
+		Namespace:      cluster.Name,
+		Token:          token,
+		URL:            settings.ServerURL.Get(),
+		IsPreBootstrap: capr.PreBootstrap(cluster),
+		Cluster:        cluster,
+		AgentFeatures:  GetDesiredFeatures(cluster),
+		Taints:         taints,
+		SecretLister:   secretLister,
+		PcExists:       pcExists,
+		Mutator:        namespace.GetMutator(),
+	})
 	return buf.Bytes(), err
 }
 
@@ -353,6 +416,19 @@ func GetDesiredAuthImage(cluster *apimgmtv3.Cluster) string {
 	}
 	logrus.Tracef("clusterDeploy: deployAgent: desiredAuth is [%s] for cluster [%s]", desiredAuth, cluster.Name)
 	return desiredAuth
+}
+
+func GetDesiredAssetsImage(cluster *apimgmtv3.Cluster) string {
+	logrus.Tracef("clusterDeploy: getting desired charts image for [%s]", cluster.Name)
+	desiredCharts := cluster.Spec.DesiredAssetsImage
+	if cluster.Spec.AssetsImageOverride != "" {
+		desiredCharts = cluster.Spec.AssetsImageOverride
+	}
+	if desiredCharts == "" || desiredCharts == "fixed" {
+		desiredCharts = image.ResolveWithCluster(settings.AssetsImage.Get(), cluster)
+	}
+	logrus.Tracef("clusterDeploy: desiredCharts is [%s] for cluster [%s]", desiredCharts, cluster.Name)
+	return desiredCharts
 }
 
 func toYAML(v interface{}) string {

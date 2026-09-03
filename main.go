@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/docker/docker/pkg/reexec"
 	"github.com/ehazlett/simplelog"
+	"github.com/moby/sys/reexec"
 	_ "github.com/rancher/norman/controller"
 	"github.com/rancher/norman/pkg/kwrapper/k8s"
 	"github.com/rancher/rancher/pkg/data/management"
@@ -147,6 +147,12 @@ func main() {
 			EnvVar:      "AUDIT_LOG_ENABLED",
 			Destination: &config.AuditLogEnabled,
 		},
+		cli.BoolFlag{
+			Name:        "audit-exclude-groups",
+			Usage:       "Indicates that user groups should not be logged in the auditing, this can reduce the bandwidth",
+			EnvVar:      "AUDIT_EXCLUDE_GROUPS",
+			Destination: &config.AuditLogExcludeGroups,
+		},
 		cli.StringFlag{
 			Name:        "profile-listen-address",
 			Value:       "127.0.0.1:6060",
@@ -217,7 +223,6 @@ func initLogs(c *cli.Context, cfg rancher.Options) {
 
 func run(cli *cli.Context, cfg rancher.Options) error {
 	logrus.Infof("Rancher version %s is starting", version.FriendlyVersion())
-	logrus.Infof("Rancher arguments %+v", cfg)
 	ctx := signals.SetupSignalContext()
 
 	if cfg.AddLocal != "true" && cfg.AddLocal != "auto" {
@@ -229,6 +234,8 @@ func run(cli *cli.Context, cfg rancher.Options) error {
 		return err
 	}
 	cfg.Embedded = embedded
+	cfg.LocalUserPasswordsNamespace = true
+	logrus.Infof("Rancher arguments %+v", cfg)
 
 	os.Unsetenv("KUBECONFIG")
 

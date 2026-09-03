@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/rancher/rancher/pkg/auth/providers"
 	"github.com/rancher/rancher/pkg/auth/providers/local"
 	"github.com/rancher/rancher/pkg/namespace"
@@ -37,6 +36,7 @@ type tokenAuthenticator struct {
 	secrets            wcorev1.SecretClient
 	isDisabledProvider func(provider string) (bool, error)
 	expireTokensAfter  func() time.Duration
+	getConfig          func(provider string) providerConfig
 }
 
 // Authenticate implements the http middleware for tokenAuthenticator.
@@ -49,7 +49,7 @@ func (a *tokenAuthenticator) Authenticate(next http.Handler) http.Handler {
 		}
 		token := parts[1]
 
-		provider := mux.Vars(r)["provider"]
+		provider := r.PathValue("provider")
 
 		if provider == local.Name {
 			// We don't suppport the "local" provider for SCIM as it's not intended
@@ -60,6 +60,16 @@ func (a *tokenAuthenticator) Authenticate(next http.Handler) http.Handler {
 		disabled, err := a.isDisabledProvider(provider)
 		if err != nil || disabled {
 			writeError(w, NewError(http.StatusNotFound, http.StatusText(http.StatusNotFound)))
+			return
+		}
+
+		cfg := a.getConfig(provider)
+		if !cfg.Enabled {
+			writeError(w, NewError(http.StatusNotFound, http.StatusText(http.StatusNotFound)))
+			return
+		}
+		if cfg.Paused {
+			writeError(w, NewError(http.StatusServiceUnavailable, "SCIM provisioning is temporarily paused"))
 			return
 		}
 
@@ -103,10 +113,12 @@ func (a *tokenAuthenticator) Authenticate(next http.Handler) http.Handler {
 
 // NewTokenAuthenticator returns a new tokenAuthenticator instance.
 func NewTokenAuthenticator(wContext *wrangler.Context) *tokenAuthenticator {
+	cmCache := wContext.Core.ConfigMap().Cache()
 	return &tokenAuthenticator{
 		secretCache:        wContext.Core.Secret().Cache(),
 		secrets:            wContext.Core.Secret(),
 		isDisabledProvider: providers.IsDisabledProvider,
 		expireTokensAfter:  func() time.Duration { return settings.ExpireSCIMTokensAfter.GetDuration() },
+		getConfig:          func(provider string) providerConfig { return getProviderConfig(cmCache, provider) },
 	}
 }
